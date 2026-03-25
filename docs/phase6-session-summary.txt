@@ -1,0 +1,220 @@
+PHASE 6 SESSION SUMMARY
+MileagePlus Deal Finder — Playwright Scraper with Snapshot Grouping and Portal-to-DB Pipeline
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Build a Playwright-based scraper that authenticates with the MileagePlus
+Shopping portal, scrapes retailer base rates, bonus offers, and T&C text,
+writes everything to the database under a single scrape snapshot, and chains
+with the Phase 5 parser to populate tc_rules and bonus_offers with structured
+data. A single command produces a complete snapshot that the Julia scoring
+engine can read.
+
+ENVIRONMENT SETUP
+-----------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+2. Database initialized with: rm -f db/mileageplus.db && bash db/init.sh
+3. Scraper dependencies installed: cd scraper && npm install
+4. Playwright install attempted: npx playwright install chromium
+   FAILED — Chromium download failed in cloud environment (no browser binary
+   available). Mock mode used instead.
+5. better-sqlite3 added to scraper/package.json as runtime dependency.
+6. Bridge dependencies already installed from Phase 5.
+
+FILES CREATED / MODIFIED
+--------------------------
+
+scraper/package.json  [NEW — replaces stub]
+  Defines mileageplus-scraper v0.6.0 with playwright and better-sqlite3
+  dependencies. Scripts: "setup" (install chromium), "scrape" (run scraper).
+
+scraper/src/snapshot.js  [REWRITTEN — was single-line stub]
+  Snapshot lifecycle management for SQLite. Exports: createSnapshot,
+  completeSnapshot, failSnapshot, getLatestCompleteSnapshot, hasScrapedToday.
+  Timestamps formatted without milliseconds/Z suffix to match Julia's
+  dateformat"yyyy-mm-ddTHH:MM:SS" parser.
+
+scraper/src/request-log.js  [NEW]
+  Audit log writer for HTTP requests made during scrape sessions. Writes
+  NDJSON to logs/scrape-requests.log. Synchronous (appendFileSync) to
+  prevent dropped entries. Each entry: timestamp, url, method, status,
+  duration_ms, snapshot_id.
+
+scraper/src/portal-mock.js  [NEW]
+  Mock portal data module returning 3 retailers (BestBuy, Nike, Walmart)
+  matching seed data format. Used when Playwright/credentials are not
+  available. Allows end-to-end pipeline testing.
+
+scraper/src/scraper.js  [REWRITTEN — was single-line stub]
+  Main scraper entry point. Implements the full scrape pipeline:
+    - Credential check from environment variables
+    - One-per-day guard via hasScrapedToday
+    - Snapshot creation and lifecycle management
+    - Live portal scraping (Playwright) or mock fallback
+    - Randomized 2-10s delays between requests
+    - Fail-closed on CAPTCHA/429/403
+    - Serial-only retailer scraping (no parallelism)
+    - DB writes: retailers, rates, MPX rates, raw T&C/bonus text
+    - Parser chaining if ANTHROPIC_API_KEY is available
+    - Audit logging for every request
+
+bridge/server.js  [MODIFIED]
+  Added two new endpoints:
+    - GET /api/scraper/status — returns latest snapshot with age_hours
+    - GET /api/scraper/run-check — returns can_scrape boolean
+
+frontend/src/App.jsx  [MODIFIED]
+  Added Scraper tab to navigation alongside Score and Rank. Scraper panel
+  shows: snapshot status card (color-coded), check status button, run
+  scraper launcher guide (terminal instructions), refresh note.
+
+scripts/start-dev.sh  [MODIFIED]
+  Added npm install for bridge/ and scraper/ if node_modules is missing.
+
+scripts/run-scraper.sh  [NEW]
+  Thin wrapper: cd to scraper dir, run npm run scrape with JULIA_PKG_SERVER="".
+
+docs/phase6-session-summary.txt  [NEW]
+  This file.
+
+TEST RESULTS
+------------
+Command: cd engine && JULIA_PKG_SERVER="" /usr/local/bin/julia --project test/runtests.jl
+
+Result: 140 passed, 0 failed, 0 errored
+
+Breakdown:
+  - Phase 1-3 tests (test_bonus.jl, test_scoring.jl): 76 passed (unchanged)
+  - Phase 4 tests (test_phase4.jl): 64 passed (unchanged)
+  No new Julia unit tests added in this phase per scope boundaries (no Julia
+  source files modified).
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Database: rm -f db/mileageplus.db && bash db/init.sh
+Scraper: cd scraper && npm run scrape (mock mode, no credentials)
+
+Test 1 — Clean DB, scrape runs, snapshot created:
+  Command: cd scraper && npm run scrape
+  Output: Snapshot 4219ca23-18e2-4554-b8b2-2e3ebaa6c462 completed: 3 retailers, 0 errors.
+  Verify: sqlite3 db/mileageplus.db "SELECT snapshot_id, status, retailer_count FROM scrape_snapshots ORDER BY started_at DESC LIMIT 1;"
+  Result: 4219ca23-18e2-4554-b8b2-2e3ebaa6c462|complete|3
+  PASS
+
+Test 2 — One-per-day guard works:
+  Command: npm run scrape (second run)
+  Output: Already scraped today. Delete today's snapshot or wait until tomorrow.
+  Verify: sqlite3 db/mileageplus.db "SELECT COUNT(*) FROM scrape_snapshots;"
+  Result: 2 (seed-snapshot-001 + scrape snapshot)
+  PASS
+
+Test 3 — New snapshot is used for scoring:
+  Command: curl -s -X POST http://localhost:5000/score -H "Content-Type: application/json" \
+    -d '{"retailer":"BestBuy","p_list":200.0,"tax_rate":0.08,"category":"Electronics","card_tier":"none","path":"direct"}'
+  Result:
+    snapshot_id: "4219ca23-18e2-4554-b8b2-2e3ebaa6c462" (scrape snapshot, NOT seed-snapshot-001)
+    portal_miles: 400.0 (2.0 * 200.0)
+    card_miles: 0.0 (card_tier=none)
+    bonus_miles: 0.0 (tiers empty — parsing skipped without API key)
+    risk_class: "uncertain" (T&C confidence=0.0, parsing skipped)
+    total_miles: 400.0
+  PASS — snapshot_id matches scrape snapshot
+
+Test 4 — Staleness warning:
+  The scrape snapshot completed_at is "2026-03-25T21:11:24" (today).
+  age_hours: 0.0 — no staleness warning expected.
+  Seed snapshot (2026-03-24T10:05:00) would be stale but is NOT the latest.
+  PASS
+
+Test 5 — Request audit log written:
+  Command: cat logs/scrape-requests.log
+  Result: 3 NDJSON lines, one per mock retailer request. Each line is valid
+  JSON with timestamp, url, method, status, duration_ms, snapshot_id fields.
+  Sample: {"timestamp":"2026-03-25T21:11:23.699Z","url":"https://shopping.mileageplus.com/b?XID=1&retailer=bestbuy","method":"GET","status":200,"duration_ms":4636,"snapshot_id":"4219ca23-18e2-4554-b8b2-2e3ebaa6c462"}
+  PASS
+
+Test 6 — Bridge scraper status endpoint:
+  Command: curl -s http://localhost:4000/api/scraper/status
+  Result: {"snapshot_id":"4219ca23-18e2-4554-b8b2-2e3ebaa6c462","status":"complete","started_at":"2026-03-25T21:11:23","completed_at":"2026-03-25T21:11:24","retailer_count":3,"error_count":0,"age_hours":0}
+  PASS
+
+Test 7 — Bridge run-check:
+  Command: curl -s http://localhost:4000/api/scraper/run-check
+  Result: {"can_scrape":false,"reason":"already_scraped_today"}
+  PASS
+
+GIT
+---
+Branch:  claude/review-documentation-sZMEP
+Commit:  (see git log after push)
+Message: "Phase 6: Playwright scraper with snapshot grouping and portal-to-DB pipeline"
+Tag:     v0.6.0 (local)
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 6 (reserved for later phases):
+  Purchase log write path           (Phase 7)
+  Basket MILP optimizer             (Phase 8)
+  Sensitivity sweep                 (Phase 9)
+  Scheduled/automatic scraping      (not in scope — manual CLI only)
+  Scraper-trigger API endpoint      (not in scope — CLI tool only)
+  Multiple browser contexts/pages   (not in scope — serial only)
+
+NOT changed in Phase 6:
+  No Julia source files modified (types.jl, scoring.jl, database.jl, server.jl unchanged)
+  No Julia tests modified
+  SQLite schema unchanged
+  Seed data unchanged
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+
+2. The scraper ran against MOCK DATA, not the live portal. Playwright Chromium
+   could not be downloaded in the cloud environment. The mock (portal-mock.js)
+   returns 3 retailers matching seed data. When running on desktop with
+   Cowork, set MILEAGEPLUS_USERNAME and MILEAGEPLUS_PASSWORD and Playwright
+   will attempt live portal scraping.
+
+3. Live portal DOM selectors are BEST-EFFORT and untested. The scraper.js
+   has selectors for common Valuedynamx/Collinson portal structures:
+     - Retailer list: a[href*="/b__"], .store-card a, .merchant-link
+     - Rate: .earn-rate, .miles-rate, .rate-value, .store-rate
+     - T&C: .terms-conditions, .tc-text, .store-terms
+     - Bonus: .bonus-offer, .promo-text, .special-offer
+   These MUST be verified with SCRAPER_DEBUG=1 on first live run.
+
+4. ANTHROPIC_API_KEY was NOT available. T&C and bonus parsing was skipped.
+   The scraper writes raw text to tc_rules and bonus_offers with empty
+   inclusions/exclusions and confidence=0.0. The Julia engine treats
+   confidence < 0.8 as risk_class=uncertain (portal miles still included
+   with warning). Bonus tiers are empty so bonus_miles=0.
+
+5. TIMESTAMP FORMAT: The snapshot.js formats timestamps without milliseconds
+   or Z suffix (e.g., "2026-03-25T21:11:24" not "2026-03-25T21:11:24.549Z").
+   This matches the Julia engine's dateformat"yyyy-mm-ddTHH:MM:SS" parser
+   in snapshot_age_hours(). The audit log (request-log.js) still uses full
+   ISO8601 with milliseconds since it's not read by Julia.
+
+6. KNOWN ISSUE: The Julia engine's snapshot_age_hours function cannot parse
+   ISO8601 timestamps with milliseconds or Z suffix. This was worked around
+   in the scraper by stripping milliseconds/Z from timestamps. If a future
+   phase generates timestamps in a different format, the Julia function will
+   need to be updated.
+
+7. When ANTHROPIC_API_KEY is available and parsing runs, the tc_rules and
+   bonus_offers rows are updated in-place (UPDATE by retailer_id + snapshot_id).
+   The inclusions field must include ALL eligible categories per Phase 5
+   reconciliation rule: a category not in inclusions returns excluded.
+
+8. The one-per-day guard checks for snapshots with status IN ('complete',
+   'partial') started on the current UTC date. To re-scrape, either wait
+   until the next UTC day or manually delete today's snapshot from the DB.
+
+9. Database initialization: rm -f db/mileageplus.db && bash db/init.sh
+   Must delete existing DB first because INSERT OR IGNORE won't update
+   existing rows from prior seed runs.

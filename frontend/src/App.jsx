@@ -34,8 +34,14 @@ function App() {
         >
           Rank
         </button>
+        <button
+          style={tab === 'scraper' ? styles.tabActive : styles.tab}
+          onClick={() => setTab('scraper')}
+        >
+          Scraper
+        </button>
       </div>
-      {tab === 'score' ? <ScorePanel /> : <RankPanel />}
+      {tab === 'score' ? <ScorePanel /> : tab === 'rank' ? <RankPanel /> : <ScraperPanel />}
     </div>
   );
 }
@@ -540,6 +546,147 @@ function RankPanel() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Scraper Panel (Phase 6 — scrape status and launcher guide)
+// ---------------------------------------------------------------------------
+
+function ScraperPanel() {
+  const [snapshot, setSnapshot] = useState(null);
+  const [canScrape, setCanScrape] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const fetchStatus = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [statusResp, checkResp] = await Promise.all([
+        fetch('/api/scraper/status'),
+        fetch('/api/scraper/run-check'),
+      ]);
+      const statusData = await statusResp.json();
+      const checkData = await checkResp.json();
+      setSnapshot(statusData.snapshot || statusData);
+      setCanScrape(checkData);
+    } catch (err) {
+      setError(`Network error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const statusColor = (s) => {
+    if (s === 'complete') return '#2e7d32';
+    if (s === 'partial') return '#f9a825';
+    if (s === 'failed') return '#c62828';
+    return '#666';
+  };
+
+  return (
+    <div>
+      <p style={styles.subtitle}>Scraper Status & Launcher</p>
+
+      <button onClick={fetchStatus} disabled={loading} style={styles.button}>
+        {loading ? 'Checking...' : 'Check scrape status'}
+      </button>
+
+      {error && (
+        <div style={styles.errorPanel}>
+          <strong>Error:</strong> {error}
+        </div>
+      )}
+
+      {snapshot && snapshot.snapshot_id && (
+        <div style={{ ...styles.resultPanel, marginTop: 16 }}>
+          <h2 style={styles.resultTitle}>Latest Snapshot</h2>
+          <table style={styles.table}>
+            <tbody>
+              <tr>
+                <td style={styles.tdLabel}>Snapshot ID</td>
+                <td style={styles.tdValue}>{snapshot.snapshot_id.slice(0, 8)}...</td>
+              </tr>
+              <tr>
+                <td style={styles.tdLabel}>Status</td>
+                <td style={styles.tdValue}>
+                  <span style={{
+                    ...styles.badge,
+                    backgroundColor: statusColor(snapshot.status),
+                  }}>
+                    {snapshot.status}
+                  </span>
+                </td>
+              </tr>
+              <tr>
+                <td style={styles.tdLabel}>Completed</td>
+                <td style={styles.tdValue}>
+                  {snapshot.completed_at ? new Date(snapshot.completed_at).toLocaleString() : 'In progress'}
+                </td>
+              </tr>
+              <tr>
+                <td style={styles.tdLabel}>Retailers</td>
+                <td style={styles.tdValue}>{snapshot.retailer_count}</td>
+              </tr>
+              <tr>
+                <td style={styles.tdLabel}>Errors</td>
+                <td style={styles.tdValue}>{snapshot.error_count}</td>
+              </tr>
+              {snapshot.age_hours != null && (
+                <tr>
+                  <td style={styles.tdLabel}>Age</td>
+                  <td style={{ ...styles.tdValue, color: snapshot.age_hours > 24 ? '#c62828' : 'inherit' }}>
+                    {snapshot.age_hours.toFixed(1)} hours
+                    {snapshot.age_hours > 24 && ' (stale — consider re-scraping)'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {snapshot && !snapshot.snapshot_id && (
+        <div style={{ ...styles.resultPanel, marginTop: 16 }}>
+          <p>No snapshots found. Run the scraper to create one.</p>
+        </div>
+      )}
+
+      <div style={{ ...styles.resultPanel, marginTop: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Run Scraper</h3>
+        {canScrape && !canScrape.can_scrape ? (
+          <p style={{ color: '#f57f17' }}>
+            Cannot scrape: {canScrape.reason === 'already_scraped_today'
+              ? 'Already scraped today. Wait until tomorrow or delete today\'s snapshot.'
+              : canScrape.reason}
+          </p>
+        ) : (
+          <div>
+            <p>To run the scraper, open a terminal in the project root and run:</p>
+            <pre style={{
+              backgroundColor: '#263238',
+              color: '#e0e0e0',
+              padding: 12,
+              borderRadius: 4,
+              fontSize: 13,
+              overflowX: 'auto',
+            }}>
+{`cd scraper && \\
+MILEAGEPLUS_USERNAME=<your_username> \\
+MILEAGEPLUS_PASSWORD=<your_password> \\
+npm run scrape`}
+            </pre>
+            <p style={{ fontSize: 13, color: '#666' }}>
+              Or without credentials (mock mode): <code>cd scraper && npm run scrape</code>
+            </p>
+          </div>
+        )}
+        <p style={{ fontSize: 13, color: '#666', marginTop: 12 }}>
+          After running the scraper, click Refresh on the Score or Rank tab to see updated rates.
+        </p>
+      </div>
     </div>
   );
 }

@@ -10,6 +10,14 @@ mkdir -p "$LOGS"
 
 echo "Starting MileagePlus Deal Finder dev environment..."
 
+# 0. Ensure npm dependencies are installed
+for dir in bridge scraper; do
+  if [ ! -d "$ROOT/$dir/node_modules" ]; then
+    echo "Installing $dir dependencies..."
+    cd "$ROOT/$dir" && npm install
+  fi
+done
+
 # 1. Julia engine (port 5000)
 echo "Starting Julia engine..."
 cd "$ROOT/engine"
