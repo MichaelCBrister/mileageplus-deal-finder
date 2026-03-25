@@ -1,0 +1,249 @@
+PHASE 2 SESSION SUMMARY
+MileagePlus Deal Finder — Node Bridge + React UI
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Implement Phase 2 of the MileagePlus Deal Finder:
+  - Node.js Express bridge server on port 4000
+  - React frontend with Vite on port 3000
+  - Single-item scoring form (direct path only)
+  - Miles breakdown display with risk class badges
+  - Startup/shutdown scripts
+
+
+ENVIRONMENT SETUP
+-----------------
+Julia was not installed in this session (fresh environment).
+Conda was available at /opt/miniconda3/bin/conda but required
+TOS acceptance before use.
+
+Steps taken:
+  1. Accepted conda TOS for repo.anaconda.com/pkgs/main and pkgs/r
+  2. Installed Julia 1.10.4 and mbedtls 2.x via:
+     conda install -y -c conda-forge julia=1.10 "mbedtls=2.*"
+  3. Installed Julia packages:
+     JULIA_PKG_SERVER="" julia --project=. -e 'using Pkg; Pkg.instantiate()'
+  4. Stale pidfiles from prior session were auto-cleaned by Julia.
+  5. CHOLMOD version warning (4.0.4 vs 5.3.1) appears but does not
+     affect functionality.
+
+Node.js v22.22.0 and npm 10.9.4 were already available.
+Express 4.21.x installed for bridge; react 18.3, vite 6.x,
+@vitejs/plugin-react 4.3 installed for frontend.
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+bridge/server.js  [NEW]
+  Express server on port 4000. Endpoints:
+    GET  /health     -> bridge + Julia status
+    POST /api/score  -> forwards to Julia engine with 2s timeout
+    POST /api/rank   -> 501 stub (Phase 4)
+  Reads JULIA_ENGINE_URL and BRIDGE_PORT from env vars.
+  Maps frontend card_tier values (none/one_x/one_five_x/two_x) to
+  Julia engine keys (none/explorer/club/quest).
+  Converts frontend tax_rate percentage to decimal for Julia.
+  Request logging middleware (method, path, status, duration).
+
+bridge/package.json  [MODIFIED]
+  Updated main from src/index.js to server.js.
+  Updated scripts to use server.js directly.
+  Version bumped to 0.2.0.
+
+bridge/.env.example  [NEW]
+  JULIA_ENGINE_URL=http://localhost:5000
+  BRIDGE_PORT=4000
+
+bridge/src/  [DELETED]
+  Removed Phase 0 scaffold stubs (index.js, julia-bridge.js, routes/).
+  Replaced by bridge/server.js.
+
+frontend/index.html  [NEW]
+  HTML entry point for Vite.
+
+frontend/vite.config.js  [NEW]
+  Vite config with React plugin, port 3000, proxy /api and /health
+  to http://localhost:4000.
+
+frontend/src/main.jsx  [NEW]
+  React entry point rendering App into #root.
+
+frontend/src/App.jsx  [IMPLEMENTED]
+  Single-page scoring form with:
+    - Retailer name (text, required)
+    - List price (number, required)
+    - Local tax rate (number, default 0)
+    - Product category (text, required)
+    - Card tier (select: none/one_x/one_five_x/two_x)
+    - Score button with loading state
+  Results panel shows:
+    - Total miles, portal miles, card miles, bonus miles
+    - Risk class badge (green=confirmed, yellow=uncertain, red=excluded)
+    - Path, MPD
+    - Full spend vector (p_list, p_portal, p_card, p_cash, v_residual)
+  Error panel for bridge/engine errors.
+
+engine/src/server.jl  [MODIFIED]
+  Two fixture data changes (no engine logic changes):
+    1. Added "none" CardTier with base_rate=0.0 and empty category_rates.
+       When card_tier="none", card_miles = 0 as expected for users with
+       no Chase United card.
+    2. Added "appliances" -> uncertain to BestBuy's risk_overrides.
+       Required for Phase 2 acceptance test 3 (uncertain category).
+    3. Added guard: when card base_rate is 0.0 (none), skip fixture
+       card rate override to preserve zero card miles.
+
+scripts/start-dev.sh  [NEW]
+  Starts Julia engine, Node bridge, Vite frontend in correct order.
+  Writes PIDs to logs/pids.txt. Waits for Julia health check.
+
+scripts/stop-dev.sh  [NEW]
+  Reads PIDs from logs/pids.txt and kills them. Falls back to
+  port-based kill if PID file is missing.
+
+.gitignore  [MODIFIED]
+  Added logs/ directory.
+
+docs/phase2-session-summary.txt  [NEW]
+  This file.
+
+
+TEST RESULTS
+------------
+Command: JULIA_PKG_SERVER="" julia --project=. test/runtests.jl
+
+Result: 76 passed, 0 failed, 0 errored
+
+All Phase 1 test groups unchanged and passing:
+  FlatTieredBonus                                    8 passed
+  RateMultiplierBonus — semantics dispatch          11 passed
+  PerOrderFlatBonus                                  4 passed
+  total_bonus_miles — multiple bonuses               2 passed
+  SpendVector                                       17 passed
+  score_direct — basic correctness                   7 passed
+  score_direct — card miles independent of delta     7 passed
+  score_direct — portal miles by risk class          5 passed
+  score_direct — with bonuses                        6 passed
+  score_direct — fixture: Macy's                     6 passed
+  score_direct — fixture: Sephora electronics        3 passed
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Julia engine started: JULIA_PKG_SERVER="" julia --project=. src/server.jl (port 5000)
+Bridge started: node server.js (port 4000)
+
+Test 1 — Bridge health check:
+  curl -s http://localhost:4000/health
+  -> {"status":"ok","julia_status":"ok"}  PASS
+
+Test 2 — Score request (BestBuy, $200, Electronics, card_tier=none, direct):
+  curl -s -X POST http://localhost:4000/api/score \
+    -H "Content-Type: application/json" \
+    -d '{"retailer":"BestBuy","p_list":200.0,"tax_rate":8,"category":"Electronics","card_tier":"none","path":"direct"}'
+  -> {
+       "total_miles": 700,
+       "portal_miles": 200,
+       "card_miles": 0,
+       "bonus_miles": 500,
+       "risk_class": "confirmed",
+       "path": "direct",
+       "mpd": 3.24,
+       "spend": {"p_list":200,"p_portal":200,"p_card":216,"p_cash":216,"v_residual":0}
+     }
+  PASS — card_miles=0 when card_tier=none. risk_class=confirmed for Electronics.
+  Math: portal=200*1.0=200, card=216*0.0=0, bonus=500 (>=50), total=700.
+
+Test 3 — Score request (BestBuy, $200, Appliances, card_tier=one_x, direct):
+  curl -s -X POST http://localhost:4000/api/score \
+    -H "Content-Type: application/json" \
+    -d '{"retailer":"BestBuy","p_list":200.0,"tax_rate":8,"category":"Appliances","card_tier":"one_x","path":"direct"}'
+  -> {
+       "total_miles": 1132,
+       "portal_miles": 200,
+       "card_miles": 432,
+       "bonus_miles": 500,
+       "risk_class": "uncertain",
+       "path": "direct",
+       "mpd": 5.24,
+       "spend": {"p_list":200,"p_portal":200,"p_card":216,"p_cash":216,"v_residual":0}
+     }
+  PASS — risk_class=uncertain for Appliances. card_miles=432 NOT affected by
+  uncertain risk class (invariant confirmed: 216*2.0=432). portal_miles=200
+  still computed (uncertain includes portal miles with warning per v3-spec §2.4).
+
+Test 4 — Bridge handles Julia engine down:
+  Killed Julia engine. Sent same request as Test 2.
+  HTTP 503: {"error":"engine_unavailable","message":"Julia engine unreachable: fetch failed"}
+  PASS
+  Restarted Julia engine before proceeding.
+
+Test 5 — Rank stub:
+  curl -s -X POST http://localhost:4000/api/rank \
+    -H "Content-Type: application/json" -d '{}'
+  HTTP 501: {"error":"not_implemented","phase":4}
+  PASS
+
+
+GIT
+---
+Branch:  claude/node-bridge-react-phase-2
+Commit:  62e544b
+Message: "Phase 2: Node bridge + React UI for single-item scoring"
+Tag:     v0.2.0 (local)
+PR:      https://github.com/MichaelCBrister/mileageplus-deal-finder/pull/2
+
+Note: Tag push to remote may return 403 (known limitation of
+Claude Code git proxy, same as Phase 1).
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 2 (reserved for later phases):
+  SQLite / DB reads               (Phase 3)
+  MPX path                        (Phase 4)
+  Stacked path                    (Phase 4)
+  rank_all + rank endpoint        (Phase 4)
+  Claude API T&C parser           (Phase 5)
+  Playwright scraper              (Phase 6)
+  Purchase log / posting tracker  (Phase 7)
+  MILP basket optimizer           (Phase 8)
+  Sensitivity sweep               (Phase 9)
+  User authentication             (not planned — single-user tool)
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /opt/miniconda3/bin/julia (installed via conda, not juliaup).
+   julialang.org is a blocked host. conda TOS must be accepted first in each
+   fresh environment.
+
+2. Always run Julia with: JULIA_PKG_SERVER=""
+
+3. If HTTP.jl fails with "could not load symbol mbedtls_strerror":
+   Run: conda install -c conda-forge "mbedtls=2.*"
+
+4. Bridge server.js is at bridge/server.js (not bridge/src/index.js).
+   The Phase 0 scaffold stubs in bridge/src/ were removed and replaced.
+
+5. Frontend uses Vite on port 3000 with proxy to bridge on port 4000.
+   No Create React App. No external UI libraries.
+
+6. Card tier mapping (frontend -> Julia engine):
+     none      -> "none"     (base_rate=0.0, card_miles=0)
+     one_x     -> "explorer" (base_rate=1.0)
+     one_five_x -> "club"    (base_rate=1.0, but 1.5x is semantic — see spec)
+     two_x     -> "quest"    (base_rate=1.0)
+
+7. Engine fixture changes made in this phase:
+     - Added "none" card tier with base_rate=0.0
+     - Added "appliances" -> uncertain risk override to BestBuy
+     - Added guard to skip fixture card rate override when card base_rate=0.0
+   These are fixture data additions, not engine logic changes.
+   All 76 Phase 1 tests still pass.
+
+8. The #1 invariant: card_miles = p_card * c_r(k) with NO delta factor.
+   Verified in Test 3: uncertain risk class, card_miles=432 (unaffected).
