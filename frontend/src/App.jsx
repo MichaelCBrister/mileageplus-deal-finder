@@ -161,6 +161,18 @@ function App() {
         <div style={styles.resultPanel}>
           <h2 style={styles.resultTitle}>Score Result</h2>
 
+          {result.snapshot_completed_at && (() => {
+            const snapshotDate = new Date(result.snapshot_completed_at);
+            const hoursAgo = (Date.now() - snapshotDate.getTime()) / (1000 * 3600);
+            const isStale = hoursAgo > 24;
+            const label = isStale ? 'Warning: rates may be stale' : 'Rates as of';
+            return (
+              <p style={{ color: isStale ? '#c62828' : '#666', fontSize: 13, margin: '0 0 12px' }}>
+                {label}: {snapshotDate.toLocaleString()}
+              </p>
+            );
+          })()}
+
           <table style={styles.table}>
             <tbody>
               <tr>
@@ -228,6 +240,31 @@ function App() {
               </tr>
             </tbody>
           </table>
+
+          {result.process_constraints && result.process_constraints.length > 0 && (
+            <div style={{ marginTop: 16 }}>
+              <h3 style={{ marginTop: 0, marginBottom: 8 }}>Retailer Warnings</h3>
+              {result.process_constraints.map((c, i) => {
+                const severityColor = c.severity === 'critical' ? '#c62828'
+                  : c.severity === 'warning' ? '#f57f17'
+                  : '#757575';
+                return (
+                  <div key={i} style={{
+                    padding: '8px 12px',
+                    marginBottom: 6,
+                    borderLeft: `4px solid ${severityColor}`,
+                    backgroundColor: '#fafafa',
+                    fontSize: 13,
+                  }}>
+                    <span style={{ fontWeight: 'bold', color: severityColor, textTransform: 'uppercase', fontSize: 11 }}>
+                      {c.severity}
+                    </span>
+                    {' '}{c.description}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>

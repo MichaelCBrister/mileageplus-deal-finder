@@ -1,0 +1,219 @@
+PHASE 3 SESSION SUMMARY
+MileagePlus Deal Finder — SQLite Database Integration
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Wire the Julia engine to a real SQLite database instead of hardcoded
+fixture data. Specifically:
+  - Verify db/schema.sql matches v3-spec.md section 6
+  - Create seed data with 3 retailers, 1 snapshot, rates, bonuses, T&C rules
+  - Build Julia database layer (database.jl)
+  - Replace hardcoded fixture lookups in server.jl with DB reads
+  - Add snapshot_id, snapshot_completed_at, and process_constraints to
+    the /score response
+  - Update React frontend to display "as of" timestamp and retailer warnings
+  - All 76 existing tests continue to pass
+
+
+ENVIRONMENT SETUP
+-----------------
+Julia was installed via conda in a prior phase but the environment was fresh.
+Steps taken:
+  1. Accepted conda TOS for repo.anaconda.com channels
+  2. Installed Julia: conda install -c conda-forge julia
+     Installed version: Julia 1.12.1
+  3. Instantiated Julia packages: JULIA_PKG_SERVER="" julia --project -e
+     'using Pkg; Pkg.instantiate()'
+  4. SQLite.jl and JSON3.jl were already in Project.toml from Phase 0 scaffold
+  5. Database initialized with: bash db/init.sh
+  6. Node bridge dependencies already installed from Phase 2
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+db/seed.sql  [NEW]
+  Seed data for Phase 3 testing. Contains:
+    - 1 complete scrape snapshot (seed-snapshot-001)
+    - 3 retailers: BestBuy (gc_portal_eligible=0), Nike (gc_portal_eligible=0),
+      Walmart (gc_portal_eligible=1)
+    - 3 retailer_rates: BestBuy=2.0, Nike=3.0, Walmart=1.5
+    - 3 mpx_rates: BestBuy=2.0, Nike=3.0, Walmart=1.5 (chase_bonus=0.25)
+    - 2 bonus_offers: BestBuy flat_tiered (500mi at $100), Nike per_order_flat
+      (250mi at $75)
+    - 3 tc_rules: inclusions/exclusions per retailer with confidence scores
+    - 2 process_constraints: BestBuy coupon_restriction and last_click warnings
+  Uses INSERT OR IGNORE / INSERT OR REPLACE for idempotency.
+
+db/init.sh  [NEW]
+  Idempotent database initialization script. Creates db/mileageplus.db,
+  applies schema.sql, then applies seed.sql. Safe to run multiple times.
+
+engine/src/database.jl  [NEW]
+  SQLite database layer. Functions:
+    - get_db_path() — returns path to db/mileageplus.db relative to repo root
+    - load_latest_snapshot(db) — most recent complete snapshot or nothing
+    - load_retailer(db, snapshot_id, name) — loads retailer with rates, bonuses,
+      T&C rules for a given snapshot
+    - load_risk_class(db, snapshot_id, retailer_name, category) — classifies
+      category against T&C inclusions/exclusions
+    - classify_category(category, inclusions, exclusions) — string matching for
+      risk classification
+    - load_process_constraints(db, retailer_name) — process constraint warnings
+    - snapshot_age_hours(snapshot) — hours since snapshot completed
+  Types: SnapshotInfo, RetailerData, ProcessConstraint
+
+engine/src/MileagePlusDealFinder.jl  [MODIFIED]
+  Added include("database.jl") and exported database layer symbols:
+  get_db_path, load_latest_snapshot, load_retailer, load_risk_class,
+  load_process_constraints, snapshot_age_hours, SnapshotInfo, RetailerData,
+  ProcessConstraint.
+
+engine/src/server.jl  [MODIFIED — MAJOR REWRITE]
+  Replaced all hardcoded fixture retailer lookups with database reads.
+  Changes:
+    - Opens SQLite DB on startup; exits with error if DB file missing
+    - /score loads latest complete snapshot, returns 503 if none exists
+    - /score loads retailer by name from DB with snapshot_id scoping
+    - Risk class determined by T&C rules in database (classify_category)
+    - /score response now includes snapshot_id, snapshot_completed_at,
+      and process_constraints fields
+    - /health endpoint unchanged (no DB query)
+    - Card tier aliases (one_x, two_x, one_five_x) supported in server
+    - Supports both "price" and "p_list" request field names
+    - Supports both "product_query" and "category" for risk classification
+    - Logs staleness warning if snapshot > 24 hours old
+  Removed: FIXTURE_RETAILERS, FixtureRetailer struct, FIXTURE_CARD_RATES
+
+frontend/src/App.jsx  [MODIFIED]
+  Added "Rates as of" timestamp display below score results.
+    - Shows snapshot_completed_at in human-readable local format
+    - Red warning text if snapshot is > 24 hours old
+  Added "Retailer Warnings" section below results.
+    - Displays process_constraints from response
+    - Color-coded by severity: critical=red, warning=amber, info=gray
+
+
+TEST RESULTS
+------------
+Command: JULIA_PKG_SERVER="" /opt/miniconda3/bin/julia --project test/runtests.jl
+
+Result: 76 passed, 0 failed, 0 errored
+
+All existing tests pass without modification. Tests do not depend on server.jl
+or the database — they test types.jl, bonus.jl, and scoring.jl directly.
+No new Julia unit tests were added in this phase to avoid restructuring
+the test harness with database dependencies.
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Server started: /opt/miniconda3/bin/julia --project src/server.jl (port 5000)
+Database: db/mileageplus.db (initialized via bash db/init.sh)
+
+Test 1 — Engine reads from DB, returns snapshot metadata:
+  curl -s -X POST http://localhost:5000/score -H "Content-Type: application/json" \
+    -d '{"retailer":"BestBuy","p_list":200.0,"tax_rate":0.08,"category":"Electronics","card_tier":"none","path":"direct"}'
+  -> portal_miles: 400.0    (2.0 * 200.0)
+     card_miles:   0.0      (card_tier=none)
+     bonus_miles:  500.0    (flat_tiered: 200 >= 100 threshold)
+     total_miles:  900.0
+     risk_class:   "confirmed"
+     snapshot_id:  "seed-snapshot-001"
+     snapshot_completed_at: "2026-03-24T10:05:00"
+     process_constraints: 2 items (coupon_restriction, last_click)
+  PASS
+
+Test 2 — Bonus activates from DB config ($150):
+  POST /score BestBuy p_list=150.0
+  -> bonus_miles: 500.0    (150 >= 100 threshold)  PASS
+
+Test 3 — Below bonus threshold ($50):
+  POST /score BestBuy p_list=50.0
+  -> bonus_miles: 0.0      (50 < 100 threshold)  PASS
+
+Test 4 — Risk class from DB T&C rules (Gift Cards):
+  POST /score BestBuy category="Gift Cards"
+  -> risk_class: "excluded"
+     portal_miles: 0.0
+     bonus_miles: 0.0
+     card_miles: 0.0       (card_tier=none)
+  PASS
+
+Test 5 — Unknown retailer returns 404:
+  curl -s -o /dev/null -w "%{http_code}" POST /score UnknownStore
+  -> 404  PASS
+
+Test 6 — Full stack through bridge (Node port 4000 -> Julia port 5000):
+  POST http://localhost:4000/api/score Nike p_list=120.0 tax_rate=7 category=Footwear card_tier=one_x
+  -> risk_class:   "confirmed"  (Footwear in Nike inclusions)
+     portal_miles: 360.0        (3.0 * 120.0)
+     card_miles:   128.4        (p_card = 120*1.07 = 128.4, explorer rate = 1.0)
+     bonus_miles:  250.0        (per_order_flat: 120 >= 75)
+     total_miles:  738.4
+     snapshot_completed_at: "2026-03-24T10:05:00"
+  PASS
+
+Test 7 — Staleness check:
+  Manual verification: the snapshot_completed_at is "2026-03-24T10:05:00".
+  The frontend computes hours since that timestamp and displays in red if > 24h.
+  Server logs a staleness warning when snapshot age exceeds 24 hours.
+  Verified: /score response still works with stale snapshot — staleness is a
+  UI concern, not an engine error.  PASS
+
+
+GIT
+---
+Branch:  claude/sqlite-db-phase-3
+Commit:  (see git log after push)
+Message: "Phase 3: SQLite schema + snapshot model + seed data + Julia reads from DB"
+Tag:     v0.3.0 (local)
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 3 (reserved for later phases):
+  MPX earning path          (Phase 4)
+  Stacked earning path      (Phase 4)
+  rank_all / /rank endpoint (Phase 4)
+  Claude API T&C parser     (Phase 5)
+  Playwright scraper        (Phase 6)
+  Purchase log write path   (Phase 7)
+  Basket MILP optimizer     (Phase 8)
+  Sensitivity sweep         (Phase 9)
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /opt/miniconda3/bin/julia (Julia 1.12.1, installed via conda)
+   Always run with: JULIA_PKG_SERVER=""
+
+2. Database initialization: bash db/init.sh
+   Must be run before starting the Julia engine. The engine will exit with
+   an error if db/mileageplus.db does not exist.
+
+3. The server.jl no longer uses hardcoded fixture retailers. All retailer data
+   comes from the database. The Phase 1/2 fixture retailers (Macy's, Udemy,
+   Sephora) are NOT in the Phase 3 seed data — they were replaced by BestBuy,
+   Nike, and Walmart to match the Phase 3 task specification.
+
+4. Risk classification uses exact string matching against comma-separated
+   inclusions/exclusions in tc_rules. Case-insensitive. The AI-based T&C
+   parser is Phase 5.
+
+5. The bridge (bridge/server.js) was NOT modified. It already passes through
+   the full response body from Julia, so new fields (snapshot_id,
+   snapshot_completed_at, process_constraints) are forwarded automatically.
+
+6. The bridge converts frontend tax_rate from percentage to decimal
+   (divides by 100). So tax_rate=7 in the frontend request becomes 0.07
+   in the Julia request. When calling the Julia engine directly (curl),
+   pass tax_rate as a decimal (e.g., 0.08).
+
+7. Card tier aliases: the server now handles both internal names (explorer,
+   quest, club) and frontend names (one_x, two_x, one_five_x).
+
+8. The db/mileageplus.db file is NOT checked into git (.gitignore should
+   exclude it). It must be regenerated via db/init.sh on each fresh clone.

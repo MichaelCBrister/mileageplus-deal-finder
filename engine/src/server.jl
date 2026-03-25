@@ -1,17 +1,20 @@
 # server.jl — HTTP.jl server on port 5000
 # Endpoints: /health, /score
-# Phase 1: fixture retailer data only (no database — DB integration is Phase 3)
+# Phase 3: reads from SQLite database instead of hardcoded fixtures.
 # Per v3-spec.md §4.1
 
 using HTTP
 using JSON3
+using SQLite
+using Dates
 
 include("types.jl")
 include("bonus.jl")
 include("scoring.jl")
+include("database.jl")
 
 # ---------------------------------------------------------------------------
-# Fixture card tiers (v3-spec.md §9)
+# Card tiers (v3-spec.md §9) — these are config, not scraped data
 # ---------------------------------------------------------------------------
 
 const CARD_TIERS = Dict{String, CardTier}(
@@ -37,90 +40,27 @@ const CARD_TIERS = Dict{String, CardTier}(
     ),
 )
 
-# ---------------------------------------------------------------------------
-# Fixture retailers and bonuses
-# Phase 1: hardcoded; Phase 3 replaces with DB reads.
-#
-# Fixtures per task spec Step 4:
-#   Macy's     base=5.0  card=2.0  RateMultiplier rate=8.0 semantics=:total  risk=confirmed
-#   Best Buy   base=1.0  card=2.0  PerOrderFlat 500 miles min $50           risk=confirmed
-#   Udemy      base=8.0  card=1.5  no bonus                                  risk=confirmed
-#   Nike       base=3.0  card=2.0  FlatTiered [(100,200),(200,500)]          risk=confirmed
-#   Sephora    base=4.0  card=2.0  no bonus   risk=uncertain("electronics"), confirmed otherwise
-#
-# DECISION: card_rate per-category overrides are not used for fixture retailers
-# because the task spec gives a single card_rate per retailer. We store them
-# in a custom category that matches the retailer name (lower-case), then look
-# up the category in card_rate(). The fixture card tier has no entry for these
-# categories, so it falls back to base_rate. We therefore set the fixture
-# card_rate by injecting it as a category entry on a per-request basis.
-#
-# Simpler approach: store the fixture card rate directly on the Retailer as
-# a category, and create a per-fixture CardTier with that category mapped.
-# ---------------------------------------------------------------------------
-
-# Fixture card tiers that match the per-retailer rates in the task spec
-# (override the default card tier's base_rate for each retailer's category).
-# These are used when the /score endpoint receives a request for a fixture retailer.
-const FIXTURE_CARD_RATES = Dict{String, Float64}(
-    "macys"    => 2.0,
-    "bestbuy"  => 2.0,
-    "udemy"    => 1.5,
-    "nike"     => 2.0,
-    "sephora"  => 2.0,
+# Map frontend one_x/two_x names to internal tier keys
+const CARD_TIER_ALIASES = Dict{String, String}(
+    "one_x" => "explorer",
+    "one_five_x" => "club",
+    "two_x" => "quest",
 )
 
-struct FixtureRetailer
-    retailer::Retailer
-    bonuses::Vector{BonusOffer}
-    # risk_class_override: if not empty, certain product queries get a different risk class
-    # Format: Dict("query_substring_lowercase" => RiskClass)
-    risk_overrides::Dict{String, RiskClass}
-end
+# ---------------------------------------------------------------------------
+# Global database connection (opened on startup)
+# ---------------------------------------------------------------------------
 
-const FIXTURE_RETAILERS = Dict{String, FixtureRetailer}(
-    "macys" => FixtureRetailer(
-        Retailer(1, "Macy's", 5.0, nothing, false, confirmed, "shopping"),
-        BonusOffer[RateMultiplierBonus(1, 8.0, total)],
-        Dict{String, RiskClass}()
-    ),
-    "bestbuy" => FixtureRetailer(
-        Retailer(2, "Best Buy", 1.0, nothing, false, confirmed, "electronics"),
-        BonusOffer[PerOrderFlatBonus(2, 500.0, 50.0)],
-        Dict{String, RiskClass}("appliances" => uncertain)
-    ),
-    "udemy" => FixtureRetailer(
-        Retailer(3, "Udemy", 8.0, nothing, false, confirmed, "education"),
-        BonusOffer[],
-        Dict{String, RiskClass}()
-    ),
-    "nike" => FixtureRetailer(
-        Retailer(4, "Nike", 3.0, nothing, false, confirmed, "shopping"),
-        BonusOffer[FlatTieredBonus(4, [(100.0, 200.0), (200.0, 500.0)])],
-        Dict{String, RiskClass}()
-    ),
-    "sephora" => FixtureRetailer(
-        Retailer(5, "Sephora", 4.0, nothing, false, confirmed, "beauty"),
-        BonusOffer[],
-        Dict{String, RiskClass}("electronics" => uncertain)
-    ),
-)
+const DB_REF = Ref{Union{SQLite.DB, Nothing}}(nothing)
 
-# Normalized lookup key from a retailer name string
-function retailer_key(name::String)::String
-    return lowercase(replace(name, r"\s+" => ""))
+function get_db()::SQLite.DB
+    return DB_REF[]::SQLite.DB
 end
 
 # ---------------------------------------------------------------------------
 # Request / Response helpers
 # ---------------------------------------------------------------------------
 
-"""
-    parse_score_request(body) → NamedTuple or error string
-
-Parse the JSON body for /score.
-Expected keys: retailer, product_query, price, card_tier
-"""
 function parse_score_request(body::String)
     local data
     try
@@ -130,8 +70,14 @@ function parse_score_request(body::String)
     end
 
     retailer_name = get(data, :retailer, nothing)
+    # Support both "product_query" (Phase 1 API) and "category" for category-based risk
     product_query = get(data, :product_query, "")
+    category      = get(data, :category, "")
     price         = get(data, :price, nothing)
+    # Also support p_list as an alias for price (Phase 2 frontend sends p_list via bridge)
+    if price === nothing
+        price = get(data, :p_list, nothing)
+    end
     card_tier_key = get(data, :card_tier, "explorer")
     tax_rate      = get(data, :tax_rate, 0.08)
 
@@ -139,27 +85,39 @@ function parse_score_request(body::String)
         return nothing, "missing field: retailer"
     end
     if price === nothing
-        return nothing, "missing field: price"
+        return nothing, "missing field: price (or p_list)"
     end
 
     price_f    = Float64(price)
     tax_rate_f = Float64(tax_rate)
 
+    # Use category if product_query is empty
+    effective_category = isempty(String(product_query)) ? String(category) : String(product_query)
+
     return (
         retailer_name = String(retailer_name),
-        product_query = String(product_query),
+        category      = effective_category,
         price         = price_f,
         card_tier_key = String(card_tier_key),
         tax_rate      = tax_rate_f,
     ), nothing
 end
 
-"""
-    score_result_to_dict(result) → Dict
+function score_result_to_dict(result::ScoreResult;
+    snapshot_id::String="",
+    snapshot_completed_at::String="",
+    process_constraints::Vector{ProcessConstraint}=ProcessConstraint[]
+)::Dict{String, Any}
+    constraints_arr = [
+        Dict{String, Any}(
+            "constraint_type" => c.constraint_type,
+            "severity" => c.severity,
+            "description" => c.description,
+            "source" => c.source
+        )
+        for c in process_constraints
+    ]
 
-Convert a ScoreResult to a plain Dict for JSON serialization.
-"""
-function score_result_to_dict(result::ScoreResult)::Dict{String, Any}
     return Dict{String, Any}(
         "path"         => string(result.path),
         "portal_miles" => result.portal_miles,
@@ -174,7 +132,10 @@ function score_result_to_dict(result::ScoreResult)::Dict{String, Any}
             "p_card"     => result.spend.p_card,
             "p_cash"     => result.spend.p_cash,
             "v_residual" => result.spend.v_residual,
-        )
+        ),
+        "snapshot_id"           => snapshot_id,
+        "snapshot_completed_at" => snapshot_completed_at,
+        "process_constraints"   => constraints_arr,
     )
 end
 
@@ -196,63 +157,78 @@ function handle_score(req::HTTP.Request)::HTTP.Response
                              JSON3.write(Dict("error" => err)))
     end
 
-    # Look up fixture retailer
-    key = retailer_key(params.retailer_name)
-    if !haskey(FIXTURE_RETAILERS, key)
-        return HTTP.Response(404, ["Content-Type" => "application/json"],
-                             JSON3.write(Dict("error" => "retailer not found: $(params.retailer_name)")))
+    db = get_db()
+
+    # Load latest complete snapshot
+    snapshot = load_latest_snapshot(db)
+    if snapshot === nothing
+        return HTTP.Response(503, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict(
+                                "error" => "no_complete_snapshot",
+                                "message" => "No complete scrape snapshot available. Run the scraper or initialize seed data."
+                             )))
     end
-    fixture = FIXTURE_RETAILERS[key]
+
+    # Load retailer from DB
+    retailer_data = load_retailer(db, snapshot.snapshot_id, params.retailer_name)
+    if retailer_data === nothing
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict(
+                                "error" => "retailer_not_found",
+                                "retailer" => params.retailer_name
+                             )))
+    end
+
+    # Determine risk class from T&C rules
+    rc = classify_category(params.category, retailer_data.tc_inclusions, retailer_data.tc_exclusions)
+    # If confidence is low, override to uncertain
+    if retailer_data.tc_confidence < 0.8
+        rc = uncertain
+    end
 
     # Look up card tier
     card_key = lowercase(params.card_tier_key)
+    # Apply aliases
+    card_key = get(CARD_TIER_ALIASES, card_key, card_key)
     if !haskey(CARD_TIERS, card_key)
         return HTTP.Response(400, ["Content-Type" => "application/json"],
                              JSON3.write(Dict("error" => "unknown card_tier: $(params.card_tier_key)")))
     end
-    base_card = CARD_TIERS[card_key]
-
-    # Build a card tier that reflects the fixture's per-retailer card rate
-    # by injecting the fixture rate into the category_rates for this retailer's category.
-    # When card_tier is "none" (base_rate=0.0), skip the fixture override — no card = no card miles.
-    if base_card.base_rate == 0.0
-        card = base_card
-    else
-        fixture_card_rate = get(FIXTURE_CARD_RATES, key, base_card.base_rate)
-        card = CardTier(
-            base_card.name,
-            fixture_card_rate,  # use fixture card rate as base for this retailer
-            base_card.category_rates
-        )
-    end
+    card = CARD_TIERS[card_key]
 
     # Build SpendVector
     spend = SpendVector(params.price; tax_rate = params.tax_rate)
 
-    # Determine effective risk class: check product_query overrides
-    retailer = fixture.retailer
-    pq_lower = lowercase(params.product_query)
-    effective_risk = retailer.risk_class
-    for (pattern, override_rc) in fixture.risk_overrides
-        if occursin(pattern, pq_lower)
-            effective_risk = override_rc
-            break
-        end
-    end
-
-    # Build a retailer with the effective risk class for this query
+    # Build retailer with the risk class determined from T&C rules
     effective_retailer = Retailer(
-        retailer.id, retailer.name, retailer.base_rate,
-        retailer.mpx_rate, retailer.gc_portal_eligible,
-        effective_risk, retailer.category
+        retailer_data.retailer.id,
+        retailer_data.retailer.name,
+        retailer_data.retailer.base_rate,
+        retailer_data.retailer.mpx_rate,
+        retailer_data.retailer.gc_portal_eligible,
+        rc,
+        params.category
     )
 
     # Score
-    result = score_direct(effective_retailer, spend, card, fixture.bonuses;
-                          product_query = params.product_query)
+    result = score_direct(effective_retailer, spend, card, retailer_data.bonuses;
+                          product_query = params.category)
+
+    # Load process constraints
+    constraints = load_process_constraints(db, params.retailer_name)
+
+    # Check staleness
+    age_hrs = snapshot_age_hours(snapshot)
+    if age_hrs > 24.0
+        @warn "Snapshot $(snapshot.snapshot_id) is $(round(age_hrs, digits=1)) hours old — rates may be stale"
+    end
 
     return HTTP.Response(200, ["Content-Type" => "application/json"],
-                         JSON3.write(score_result_to_dict(result)))
+                         JSON3.write(score_result_to_dict(result;
+                            snapshot_id = snapshot.snapshot_id,
+                            snapshot_completed_at = snapshot.completed_at,
+                            process_constraints = constraints
+                         )))
 end
 
 # ---------------------------------------------------------------------------
@@ -276,6 +252,24 @@ end
 
 function main()
     port = 5000
+
+    # Open database
+    db_path = get_db_path()
+    if !isfile(db_path)
+        @error "Database not found at $db_path. Run: bash db/init.sh"
+        exit(1)
+    end
+    DB_REF[] = SQLite.DB(db_path)
+    @info "Database opened: $db_path"
+
+    # Check for valid snapshot
+    snapshot = load_latest_snapshot(DB_REF[])
+    if snapshot !== nothing
+        @info "Latest snapshot: $(snapshot.snapshot_id) completed at $(snapshot.completed_at)"
+    else
+        @warn "No complete snapshot found. /score will return 503 until seed data or scraper runs."
+    end
+
     @info "MileagePlus Deal Finder — Julia engine starting on port $port"
     HTTP.serve(router, "0.0.0.0", port)
 end
