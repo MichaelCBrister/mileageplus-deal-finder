@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 const CARD_TIERS = [
   { value: 'none', label: 'No Chase United card' },
@@ -35,13 +35,19 @@ function App() {
           Rank
         </button>
         <button
+          style={tab === 'purchases' ? styles.tabActive : styles.tab}
+          onClick={() => setTab('purchases')}
+        >
+          Purchases
+        </button>
+        <button
           style={tab === 'scraper' ? styles.tabActive : styles.tab}
           onClick={() => setTab('scraper')}
         >
           Scraper
         </button>
       </div>
-      {tab === 'score' ? <ScorePanel /> : tab === 'rank' ? <RankPanel /> : <ScraperPanel />}
+      {tab === 'score' ? <ScorePanel /> : tab === 'rank' ? <RankPanel /> : tab === 'purchases' ? <PurchasesPanel /> : <ScraperPanel />}
     </div>
   );
 }
@@ -61,6 +67,7 @@ function ScorePanel() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [logMsg, setLogMsg] = useState(null);
 
   const handleChange = (e) => {
     setForm({ ...form, [e.target.name]: e.target.value });
@@ -301,6 +308,35 @@ function ScorePanel() {
               })}
             </div>
           )}
+
+          {result.log_template && (
+            <div style={{ marginTop: 16 }}>
+              <button
+                style={{ ...styles.button, backgroundColor: '#2e7d32', fontSize: 14 }}
+                onClick={async () => {
+                  setLogMsg(null);
+                  try {
+                    const resp = await fetch('/api/purchases', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(result.log_template),
+                    });
+                    if (resp.ok) {
+                      setLogMsg('Purchase logged. Track it in the Purchases tab.');
+                    } else {
+                      const d = await resp.json();
+                      setLogMsg(`Error: ${d.error || d.message}`);
+                    }
+                  } catch (err) {
+                    setLogMsg(`Network error: ${err.message}`);
+                  }
+                }}
+              >
+                Log this purchase
+              </button>
+              {logMsg && <p style={{ fontSize: 13, marginTop: 6, color: logMsg.startsWith('Error') ? '#c62828' : '#2e7d32' }}>{logMsg}</p>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -326,6 +362,7 @@ function RankPanel() {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
+  const [loggedRows, setLoggedRows] = useState({});
 
   const handleChange = (e) => {
     setForm({ ...form, [e.target.name]: e.target.value });
@@ -514,11 +551,12 @@ function RankPanel() {
                   <th style={styles.thRight}>MPX</th>
                   <th style={styles.th}>Risk Class</th>
                   <th style={styles.th}>Notes</th>
+                  <th style={styles.th}>Log</th>
                 </tr>
               </thead>
               <tbody>
                 {data.results.map((r, i) => (
-                  <tr key={i} style={i % 2 === 0 ? {} : { backgroundColor: '#fafafa' }}>
+                  <tr key={i} style={{ backgroundColor: loggedRows[i] ? '#e8f5e9' : (i % 2 === 0 ? 'transparent' : '#fafafa'), transition: 'background-color 0.5s' }}>
                     <td style={styles.tdLabel}>{r.retailer_name}</td>
                     <td style={styles.tdLabel}>{r.path}</td>
                     <td style={styles.tdValue}>{r.total_miles.toLocaleString()}</td>
@@ -539,6 +577,26 @@ function RankPanel() {
                     <td style={{ ...styles.tdLabel, fontSize: 12, color: '#666' }}>
                       {noteForRow(r)}
                     </td>
+                    <td style={styles.tdLabel}>
+                      {r.log_template && (
+                        <button
+                          style={{ fontSize: 11, cursor: 'pointer', color: '#1565c0' }}
+                          onClick={async () => {
+                            try {
+                              const resp = await fetch('/api/purchases', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(r.log_template),
+                              });
+                              if (resp.ok) {
+                                setLoggedRows(prev => ({ ...prev, [i]: true }));
+                                setTimeout(() => setLoggedRows(prev => { const n = { ...prev }; delete n[i]; return n; }), 2000);
+                              }
+                            } catch {}
+                          }}
+                        >Log</button>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -546,6 +604,265 @@ function RankPanel() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Purchases Panel (Phase 7 — purchase log with posting tracker)
+// ---------------------------------------------------------------------------
+
+const STATUS_COLORS = { posted: '#2e7d32', pending: '#f9a825', overdue: '#c62828' };
+
+function PurchasesPanel() {
+  const [purchases, setPurchases] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [markingId, setMarkingId] = useState(null);
+  const [markMiles, setMarkMiles] = useState('');
+  const [logForm, setLogForm] = useState({
+    retailer: '', path_type: 'direct', p_list: '', miles_expected: '',
+    risk_class: 'confirmed', snapshot_id: '',
+  });
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [advancedFields, setAdvancedFields] = useState({ p_portal: '', p_card: '', p_cash: '' });
+  const [logMsg, setLogMsg] = useState(null);
+
+  const fetchPurchases = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const resp = await fetch('/api/purchases');
+      const data = await resp.json();
+      setPurchases(data.purchases || []);
+    } catch (err) {
+      setError(`Network error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchPurchases();
+    // Prefill snapshot_id from latest snapshot
+    fetch('/api/scraper/status').then(r => r.json()).then(d => {
+      if (d.snapshot_id) setLogForm(f => ({ ...f, snapshot_id: d.snapshot_id }));
+    }).catch(() => {});
+  }, []);
+
+  const handleMarkPosted = async (id) => {
+    const miles = parseInt(markMiles, 10);
+    if (!miles || miles < 1) return;
+    try {
+      const resp = await fetch(`/api/purchases/${id}/posted`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ miles_posted: miles }),
+      });
+      if (resp.ok) { setMarkingId(null); setMarkMiles(''); fetchPurchases(); }
+    } catch {}
+  };
+
+  const handleDelete = async (id) => {
+    if (!window.confirm('Delete this purchase log entry?')) return;
+    try {
+      await fetch(`/api/purchases/${id}`, { method: 'DELETE' });
+      fetchPurchases();
+    } catch {}
+  };
+
+  const handleLogSubmit = async (e) => {
+    e.preventDefault();
+    setLogMsg(null);
+    const body = {
+      retailer: logForm.retailer,
+      path_type: logForm.path_type,
+      p_list: parseFloat(logForm.p_list),
+      miles_expected: parseInt(logForm.miles_expected, 10),
+      risk_class: logForm.risk_class,
+      snapshot_id: logForm.snapshot_id,
+    };
+    if (showAdvanced && advancedFields.p_portal) body.p_portal = parseFloat(advancedFields.p_portal);
+    if (showAdvanced && advancedFields.p_card) body.p_card = parseFloat(advancedFields.p_card);
+    if (showAdvanced && advancedFields.p_cash) body.p_cash = parseFloat(advancedFields.p_cash);
+    try {
+      const resp = await fetch('/api/purchases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (resp.ok) {
+        setLogMsg('Purchase logged successfully.');
+        setLogForm(f => ({ ...f, retailer: '', p_list: '', miles_expected: '' }));
+        setAdvancedFields({ p_portal: '', p_card: '', p_cash: '' });
+        fetchPurchases();
+      } else {
+        const d = await resp.json();
+        setLogMsg(`Error: ${d.error || d.message}`);
+      }
+    } catch (err) {
+      setLogMsg(`Network error: ${err.message}`);
+    }
+  };
+
+  // Summary stats
+  const totalCount = purchases.length;
+  const totalExpected = purchases.reduce((s, p) => s + (p.miles_expected || 0), 0);
+  const totalPosted = purchases.reduce((s, p) => s + (p.miles_posted || 0), 0);
+  const pendingMiles = purchases
+    .filter(p => p.posting_status === 'pending' || p.posting_status === 'overdue')
+    .reduce((s, p) => s + (p.miles_expected || 0), 0);
+  const postingRate = totalExpected > 0 ? ((totalPosted / totalExpected) * 100).toFixed(1) : null;
+
+  return (
+    <div>
+      <p style={styles.subtitle}>Purchase Log & Posting Tracker</p>
+
+      {/* Summary bar */}
+      <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 16, padding: '12px 16px', backgroundColor: '#e3f2fd', borderRadius: 4 }}>
+        <div><strong>{totalCount}</strong> <span style={{ fontSize: 13, color: '#555' }}>Purchases</span></div>
+        <div><strong>{totalExpected.toLocaleString()}</strong> <span style={{ fontSize: 13, color: '#555' }}>Expected Miles</span></div>
+        <div><strong>{totalPosted.toLocaleString()}</strong> <span style={{ fontSize: 13, color: '#555' }}>Posted Miles</span></div>
+        <div><strong>{pendingMiles.toLocaleString()}</strong> <span style={{ fontSize: 13, color: '#555' }}>Pending Miles</span></div>
+      </div>
+      {postingRate !== null && (
+        <p style={{ fontSize: 13, color: '#555', margin: '0 0 16px' }}>
+          {postingRate}% of expected miles have posted.
+        </p>
+      )}
+
+      <button onClick={fetchPurchases} disabled={loading} style={{ ...styles.button, marginBottom: 16 }}>
+        {loading ? 'Loading...' : 'Refresh'}
+      </button>
+
+      {error && <div style={styles.errorPanel}><strong>Error:</strong> {error}</div>}
+
+      {/* Purchase history table */}
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ ...styles.table, fontSize: 13 }}>
+          <thead>
+            <tr>
+              <th style={styles.th}>Date</th>
+              <th style={styles.th}>Retailer</th>
+              <th style={styles.th}>Path</th>
+              <th style={styles.thRight}>Expected Miles</th>
+              <th style={styles.thRight}>Posted Miles</th>
+              <th style={styles.th}>Status</th>
+              <th style={styles.th}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {purchases.map((p) => (
+              <tr key={p.purchase_id}>
+                <td style={styles.tdLabel}>{new Date(p.purchased_at).toLocaleDateString()}</td>
+                <td style={styles.tdLabel}>{p.retailer_name}</td>
+                <td style={styles.tdLabel}>{p.path_type}</td>
+                <td style={styles.tdValue}>{(p.miles_expected || 0).toLocaleString()}</td>
+                <td style={styles.tdValue}>{p.miles_posted != null ? p.miles_posted.toLocaleString() : '-'}</td>
+                <td style={{ ...styles.tdLabel, textAlign: 'center' }}>
+                  <span style={{ ...styles.badge, backgroundColor: STATUS_COLORS[p.posting_status] || '#666', fontSize: 11, padding: '1px 8px' }}>
+                    {p.posting_status}
+                  </span>
+                </td>
+                <td style={{ ...styles.tdLabel, whiteSpace: 'nowrap' }}>
+                  {p.posting_status !== 'posted' && (
+                    markingId === p.purchase_id ? (
+                      <span>
+                        <input type="number" min="1" value={markMiles} onChange={e => setMarkMiles(e.target.value)}
+                          style={{ width: 70, padding: 2, fontSize: 12 }} placeholder="miles" />
+                        <button onClick={() => handleMarkPosted(p.purchase_id)}
+                          style={{ fontSize: 11, marginLeft: 4, cursor: 'pointer' }}>Save</button>
+                        <button onClick={() => { setMarkingId(null); setMarkMiles(''); }}
+                          style={{ fontSize: 11, marginLeft: 2, cursor: 'pointer' }}>X</button>
+                      </span>
+                    ) : (
+                      <button onClick={() => setMarkingId(p.purchase_id)}
+                        style={{ fontSize: 11, cursor: 'pointer', marginRight: 4 }}>Mark Posted</button>
+                    )
+                  )}
+                  <button onClick={() => handleDelete(p.purchase_id)}
+                    style={{ fontSize: 11, cursor: 'pointer', color: '#c62828' }}>Delete</button>
+                </td>
+              </tr>
+            ))}
+            {purchases.length === 0 && (
+              <tr><td colSpan={7} style={{ padding: 12, textAlign: 'center', color: '#999' }}>No purchases logged yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Manual log form */}
+      <div style={{ ...styles.resultPanel, marginTop: 24 }}>
+        <h3 style={{ marginTop: 0 }}>Log a Purchase</h3>
+        <form onSubmit={handleLogSubmit} style={styles.form}>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+            <div style={styles.field}>
+              <label>Retailer</label>
+              <input type="text" value={logForm.retailer} onChange={e => setLogForm({ ...logForm, retailer: e.target.value })}
+                required placeholder="e.g. BestBuy" style={styles.input} />
+            </div>
+            <div style={styles.field}>
+              <label>Path</label>
+              <select value={logForm.path_type} onChange={e => setLogForm({ ...logForm, path_type: e.target.value })} style={styles.input}>
+                <option value="direct">Direct</option>
+                <option value="mpx">MPX</option>
+                <option value="stacked">Stacked</option>
+              </select>
+            </div>
+            <div style={styles.field}>
+              <label>List Price ($)</label>
+              <input type="number" step="0.01" min="0" value={logForm.p_list}
+                onChange={e => setLogForm({ ...logForm, p_list: e.target.value })} required style={styles.input} />
+            </div>
+            <div style={styles.field}>
+              <label>Expected Miles</label>
+              <input type="number" min="1" value={logForm.miles_expected}
+                onChange={e => setLogForm({ ...logForm, miles_expected: e.target.value })} required style={styles.input} />
+            </div>
+            <div style={styles.field}>
+              <label>Risk Class</label>
+              <select value={logForm.risk_class} onChange={e => setLogForm({ ...logForm, risk_class: e.target.value })} style={styles.input}>
+                <option value="confirmed">confirmed</option>
+                <option value="uncertain">uncertain</option>
+                <option value="excluded">excluded</option>
+              </select>
+            </div>
+            <div style={styles.field}>
+              <label>Snapshot ID</label>
+              <input type="text" value={logForm.snapshot_id} onChange={e => setLogForm({ ...logForm, snapshot_id: e.target.value })}
+                required style={{ ...styles.input, fontSize: 11, width: 200 }} />
+            </div>
+          </div>
+          <div>
+            <button type="button" onClick={() => setShowAdvanced(!showAdvanced)}
+              style={{ background: 'none', border: 'none', color: '#1565c0', cursor: 'pointer', fontSize: 12, padding: 0 }}>
+              {showAdvanced ? 'Hide' : 'Show'} Advanced (spend vector)
+            </button>
+            {showAdvanced && (
+              <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
+                <div style={styles.field}>
+                  <label style={{ fontSize: 12 }}>p_portal</label>
+                  <input type="number" step="0.01" value={advancedFields.p_portal}
+                    onChange={e => setAdvancedFields({ ...advancedFields, p_portal: e.target.value })} style={styles.input} />
+                </div>
+                <div style={styles.field}>
+                  <label style={{ fontSize: 12 }}>p_card</label>
+                  <input type="number" step="0.01" value={advancedFields.p_card}
+                    onChange={e => setAdvancedFields({ ...advancedFields, p_card: e.target.value })} style={styles.input} />
+                </div>
+                <div style={styles.field}>
+                  <label style={{ fontSize: 12 }}>p_cash</label>
+                  <input type="number" step="0.01" value={advancedFields.p_cash}
+                    onChange={e => setAdvancedFields({ ...advancedFields, p_cash: e.target.value })} style={styles.input} />
+                </div>
+              </div>
+            )}
+          </div>
+          <button type="submit" style={styles.button}>Log Purchase</button>
+        </form>
+        {logMsg && <p style={{ marginTop: 8, fontSize: 13, color: logMsg.startsWith('Error') ? '#c62828' : '#2e7d32' }}>{logMsg}</p>}
+      </div>
     </div>
   );
 }

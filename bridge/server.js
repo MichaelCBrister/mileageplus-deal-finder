@@ -5,6 +5,7 @@ const express = require('express');
 const path = require('path');
 const Database = require('better-sqlite3');
 const { parseTAndC, parseBonus } = require('./tc-parser');
+const { insertPurchase, listPurchases, markPosted, deletePurchase } = require('./purchase-log');
 
 const JULIA_ENGINE_URL = process.env.JULIA_ENGINE_URL || 'http://localhost:5000';
 const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '4000', 10);
@@ -66,6 +67,28 @@ app.post('/api/score', async (req, res) => {
     clearTimeout(timeout);
 
     const data = await resp.json();
+
+    // Inject log_template for the frontend "Log this purchase" button (Phase 7)
+    if (resp.ok && data.total_miles != null) {
+      const taxDecimal = (body.tax_rate || 0) / 100;
+      const pList = body.p_list;
+      const pathType = data.path || 'direct';
+      const pCard = pList * (1 + taxDecimal);
+      // For mpx and stacked paths, p_cash = p_list (gift card purchase amount equals list price)
+      const pCash = (pathType === 'mpx' || pathType === 'stacked') ? pList : pCard;
+      data.log_template = {
+        retailer: body.retailer,
+        path_type: pathType,
+        p_list: pList,
+        p_portal: pList,
+        p_card: pCard,
+        p_cash: pCash,
+        miles_expected: Math.round(data.total_miles),
+        risk_class: data.risk_class || 'uncertain',
+        snapshot_id: data.snapshot_id || '',
+      };
+    }
+
     res.status(resp.status).json(data);
   } catch (err) {
     const message = err.name === 'AbortError'
@@ -101,6 +124,30 @@ app.post('/api/rank', async (req, res) => {
     clearTimeout(timeout);
 
     const data = await resp.json();
+
+    // Inject log_template on each rank result for the frontend "Log" button (Phase 7)
+    if (resp.ok && data.results && Array.isArray(data.results)) {
+      const taxDecimal = (body.tax_rate || 0) / 100;
+      const pList = body.p_list;
+      data.results = data.results.map((r) => {
+        const pathType = r.path || 'direct';
+        const pCard = pList * (1 + taxDecimal);
+        const pCash = (pathType === 'mpx' || pathType === 'stacked') ? pList : pCard;
+        r.log_template = {
+          retailer: r.retailer_name || '',
+          path_type: pathType,
+          p_list: pList,
+          p_portal: pList,
+          p_card: pCard,
+          p_cash: pCash,
+          miles_expected: Math.round(r.total_miles || 0),
+          risk_class: r.risk_class || 'uncertain',
+          snapshot_id: data.snapshot_id || '',
+        };
+        return r;
+      });
+    }
+
     res.status(resp.status).json(data);
   } catch (err) {
     const message = err.name === 'AbortError'
@@ -306,6 +353,113 @@ app.get('/api/scraper/run-check', (_req, res) => {
     }
   } catch (err) {
     res.status(500).json({ error: 'db_error', message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/purchases — Log a new purchase (Phase 7)
+// ---------------------------------------------------------------------------
+
+app.post('/api/purchases', (req, res) => {
+  try {
+    const { retailer, path_type, p_list, miles_expected, risk_class, snapshot_id } = req.body;
+
+    if (!retailer || !path_type || p_list == null || miles_expected == null || !risk_class || !snapshot_id) {
+      return res.status(400).json({
+        error: 'missing_fields',
+        message: 'Required: retailer, path_type, p_list, miles_expected, risk_class, snapshot_id',
+      });
+    }
+
+    if (!['direct', 'mpx', 'stacked'].includes(path_type)) {
+      return res.status(400).json({ error: 'invalid_path_type', message: 'path_type must be direct, mpx, or stacked' });
+    }
+
+    if (!['confirmed', 'uncertain', 'excluded'].includes(risk_class)) {
+      return res.status(400).json({ error: 'invalid_risk_class', message: 'risk_class must be confirmed, uncertain, or excluded' });
+    }
+
+    const db = new Database(DB_PATH);
+    const result = insertPurchase(db, req.body);
+    db.close();
+
+    if (result.error === 'retailer_not_found') {
+      return res.status(404).json({ error: 'retailer_not_found', retailer: result.retailer });
+    }
+
+    res.status(201).json(result);
+  } catch (err) {
+    console.error('Error in POST /api/purchases:', err.message);
+    res.status(500).json({ error: 'server_error', message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/purchases — List all logged purchases (Phase 7)
+// ---------------------------------------------------------------------------
+
+app.get('/api/purchases', (_req, res) => {
+  try {
+    const db = new Database(DB_PATH);
+    const result = listPurchases(db);
+    db.close();
+    res.json(result);
+  } catch (err) {
+    console.error('Error in GET /api/purchases:', err.message);
+    res.status(500).json({ error: 'server_error', message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /api/purchases/:id/posted — Mark purchase as posted (Phase 7)
+// ---------------------------------------------------------------------------
+
+app.patch('/api/purchases/:id/posted', (req, res) => {
+  try {
+    const purchaseId = parseInt(req.params.id, 10);
+    const { miles_posted, posted_at } = req.body;
+
+    if (miles_posted == null || typeof miles_posted !== 'number' || miles_posted < 1 || !Number.isInteger(miles_posted)) {
+      return res.status(400).json({
+        error: 'invalid_miles_posted',
+        message: 'miles_posted is required and must be a positive integer',
+      });
+    }
+
+    const db = new Database(DB_PATH);
+    const result = markPosted(db, purchaseId, miles_posted, posted_at || null);
+    db.close();
+
+    if (!result) {
+      return res.status(404).json({ error: 'not_found', message: `Purchase ${purchaseId} not found` });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error('Error in PATCH /api/purchases/:id/posted:', err.message);
+    res.status(500).json({ error: 'server_error', message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/purchases/:id — Delete a purchase log entry (Phase 7)
+// ---------------------------------------------------------------------------
+
+app.delete('/api/purchases/:id', (req, res) => {
+  try {
+    const purchaseId = parseInt(req.params.id, 10);
+    const db = new Database(DB_PATH);
+    const deleted = deletePurchase(db, purchaseId);
+    db.close();
+
+    if (!deleted) {
+      return res.status(404).json({ error: 'not_found', message: `Purchase ${purchaseId} not found` });
+    }
+
+    res.json({ deleted: true, purchase_id: purchaseId });
+  } catch (err) {
+    console.error('Error in DELETE /api/purchases/:id:', err.message);
+    res.status(500).json({ error: 'server_error', message: err.message });
   }
 });
 
