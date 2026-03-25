@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd engine && julia --project=. -e 'using Pkg; Pkg.instantiate()' && cd ../bridge && npm install && cd ../frontend && npm install"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cd engine*)",
+      "Bash(cd bridge*)",
+      "Bash(cd frontend*)",
+      "Bash(cd db*)",
+      "Bash(cd scraper*)",
+      "Bash(cd test*)",
+      "Bash(julia*)",
+      "Bash(node*)",
+      "Bash(npm*)",
+      "Bash(sqlite3*)",
+      "Bash(curl localhost*)",
+      "Bash(git*)",
+      "Bash(cat*)",
+      "Bash(ls*)",
+      "Bash(mkdir*)",
+      "Bash(cp*)",
+      "Bash(mv*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /)*",
+      "Bash(sudo rm*)"
+    ]
+  }
+}
