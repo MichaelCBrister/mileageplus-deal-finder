@@ -463,6 +463,70 @@ app.delete('/api/purchases/:id', (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/basket — Basket optimization with two-phase async response (Phase 8)
+// ---------------------------------------------------------------------------
+
+app.post('/api/basket', async (req, res) => {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000); // 30s per v3-spec
+
+    const body = req.body;
+    const juliaBody = {
+      items: body.items || [],
+      category: body.category || '',
+      card_tier: mapCardTier(body.card_tier),
+      budget: body.budget || 0,
+      tax_rate: (body.tax_rate || 0) / 100, // frontend sends percentage, Julia expects decimal
+    };
+    if (body.risk_filter) {
+      juliaBody.risk_filter = body.risk_filter;
+    }
+
+    const resp = await fetch(`${JULIA_ENGINE_URL}/basket`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(juliaBody),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    const data = await resp.json();
+    res.status(resp.status).json(data);
+  } catch (err) {
+    const message = err.name === 'AbortError'
+      ? 'Julia engine request timed out (30s)'
+      : `Julia engine unreachable: ${err.message}`;
+    res.status(503).json({ error: 'engine_unavailable', message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/basket/status/:job_id — Poll MILP solution status (Phase 8)
+// ---------------------------------------------------------------------------
+
+app.get('/api/basket/status/:job_id', async (req, res) => {
+  try {
+    const jobId = req.params.job_id;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const resp = await fetch(`${JULIA_ENGINE_URL}/basket/status/${jobId}`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    const data = await resp.json();
+    res.status(resp.status).json(data);
+  } catch (err) {
+    const message = err.name === 'AbortError'
+      ? 'Julia engine request timed out (5s)'
+      : `Julia engine unreachable: ${err.message}`;
+    res.status(503).json({ error: 'engine_unavailable', message });
+  }
+});
+
 app.listen(BRIDGE_PORT, () => {
   console.log(`Bridge server listening on port ${BRIDGE_PORT}`);
   console.log(`Julia engine URL: ${JULIA_ENGINE_URL}`);

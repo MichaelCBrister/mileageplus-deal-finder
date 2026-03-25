@@ -1,0 +1,246 @@
+PHASE 8 SESSION SUMMARY
+MileagePlus Deal Finder — Order-Level MILP Basket Optimizer with Two-Phase Async Response
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Implement the order-level MILP basket optimizer in the Julia engine with a
+two-phase async response (greedy immediate + MILP polled), wire /basket and
+/basket/status/:job_id endpoints in both Julia and the Node bridge, and add
+a Basket tab to the React frontend where the user enters a shopping list and
+sees first a greedy solution and then the MILP-optimized assignment when it
+completes. Per-order bonuses (flat_tiered, per_order_flat) are correctly
+modeled as order-level decision variables, enabling the MILP to find bonus
+consolidation opportunities that the per-item greedy solver misses.
+
+
+ENVIRONMENT SETUP
+-----------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+2. Database initialized with: rm -f db/mileageplus.db && bash db/init.sh
+3. JuMP v1.30.0 and HiGHS v1.22.2 already in Project.toml from prior session.
+   Packages instantiated successfully.
+4. UUIDs stdlib used for job ID generation (no additional dependency needed).
+5. Bridge dependencies already installed from prior phases.
+6. Frontend dependencies already installed from prior phases.
+7. Smoke test: JuMP + HiGHS solver confirmed working with bounded LP
+   (optimize returns 100.0 for Max x subject to x <= 100).
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+engine/src/basket.jl  [NEW]
+  Order-level MILP basket optimizer. Contains:
+    - ItemAssignment, GreedyResult, MILPResult structs
+    - CandidateOrder struct (fixed retailer+path pair)
+    - OrderBonusTier struct for MILP bonus modeling
+    - item_miles() — per-item miles for a candidate order (all 3 paths)
+    - per_item_miles_no_bonus() — per-item miles excluding order-level bonuses
+    - build_candidate_orders() — generates candidate orders from retailers
+    - greedy_basket() — fast per-item-best solver with budget constraint
+    - milp_basket() — JuMP/HiGHS MILP with x[i,o], y[o], z[t] variables
+
+engine/src/MileagePlusDealFinder.jl  [MODIFIED]
+  Added include("basket.jl") and exports for all basket types and functions.
+
+engine/src/server.jl  [MODIFIED]
+  Added:
+    - using UUIDs
+    - include("basket.jl")
+    - BASKET_JOBS dict for in-memory job state
+    - assignment_to_dict, greedy_to_dict, milp_to_dict serialization helpers
+    - handle_basket() — /basket endpoint with two-phase async response
+    - handle_basket_status() — /basket/status/:job_id polling endpoint
+    - Router entries for both endpoints
+
+engine/test/runtests.jl  [MODIFIED]
+  Added include of basket.jl and test_phase8.jl.
+
+engine/test/test_phase8.jl  [NEW]
+  Phase 8 unit tests:
+    - greedy_basket basic: 2 items, 3 retailers, feasibility check
+    - greedy_basket budget binding: budget too tight for all items
+    - milp_basket bonus threshold consolidation: 2 items at $60 each
+      consolidated at BestBuy to trigger $100 threshold bonus
+    - milp_basket infeasible: zero budget with positive-cost items
+    - milp_basket basic feasible: single item, single retailer
+
+bridge/server.js  [MODIFIED]
+  Added:
+    - POST /api/basket — forwards to Julia with 30s timeout
+    - GET /api/basket/status/:job_id — forwards to Julia with 5s timeout
+
+frontend/src/BasketTab.jsx  [NEW]
+  Basket tab component (split from App.jsx to avoid bloat):
+    - Dynamic item entry form with add/remove
+    - Tax rate, card tier, budget, risk filter inputs
+    - Two-phase results display (greedy immediate, MILP polled)
+    - Polling logic with 2s interval, 35s safety stop
+    - Improvement comparison banner
+    - "Log all assignments" button for purchase logging
+
+frontend/src/App.jsx  [MODIFIED]
+  Added: import BasketTab, Basket tab button in navigation bar,
+  BasketTab rendering in tab switch. 3 targeted edits only.
+
+docs/phase8-session-summary.txt  [NEW]
+  This file.
+
+
+TEST RESULTS
+------------
+Command: cd engine && JULIA_PKG_SERVER="" /usr/local/bin/julia --project test/runtests.jl
+
+Result: 166 passed, 0 failed, 0 errored
+
+Breakdown:
+  - Phase 1-3 tests (test_bonus.jl, test_scoring.jl): 76 passed (unchanged)
+  - Phase 4 tests (test_phase4.jl): 64 passed (unchanged)
+  - Phase 8 tests (test_phase8.jl): 26 passed
+    - greedy_basket basic 2 items: 6
+    - greedy_basket budget binding: 3
+    - milp_basket bonus threshold consolidation: 5
+    - milp_basket infeasible (zero budget): 1
+    - milp_basket basic feasible: 5
+    - milp_available flag check: implicit (HiGHS loaded successfully)
+
+HiGHS was available and all MILP tests ran without skipping.
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Julia engine started: /usr/local/bin/julia --project src/server.jl (port 5000)
+Node bridge started: node server.js (port 4000)
+Database: db/mileageplus.db (initialized via bash db/init.sh)
+
+Test 1 — Basket Phase 1 response (greedy, immediate):
+  curl -s -X POST http://localhost:4000/api/basket -H "Content-Type: application/json" \
+    -d '{"items":[{"name":"TV","p_list":500},{"name":"Laptop","p_list":300}],"category":"Electronics","card_tier":"none","budget":1000,"tax_rate":0}'
+  -> job_id: "d61fe457-3262-4c81-8ba0-84606d5e49cc"
+     status: "running"
+     greedy.assignments: TV->Nike/mpx (1875 miles), Laptop->Nike/mpx (1125 miles)
+     greedy.total_miles: 3000
+     greedy.total_spend: 800
+     greedy.feasible: true
+     milp: null
+  PASS
+
+Test 2 — Poll for MILP result:
+  curl -s http://localhost:4000/api/basket/status/d61fe457-3262-4c81-8ba0-84606d5e49cc
+  -> status: "complete" on first poll (2s)
+     milp.total_miles: 3000
+     milp.total_spend: 800
+     milp.feasible: true
+     milp.termination_status: "OPTIMAL"
+     milp.optimality_gap: 0
+     milp.solve_time_seconds: 0.197
+  PASS
+
+Test 3 — Bonus threshold consolidation (KEY CORRECTNESS TEST):
+  curl -s -X POST http://localhost:4000/api/basket -H "Content-Type: application/json" \
+    -d '{"items":[{"name":"Item A","p_list":60},{"name":"Item B","p_list":60}],"category":"Electronics","card_tier":"none","budget":500,"tax_rate":0}'
+  Greedy: Item A->Nike/mpx (225), Item B->Nike/mpx (225) = 450 total miles
+  MILP:   Item A->BestBuy/direct (120), Item B->BestBuy/direct (120) + 500 bonus = 740 total miles
+  MILP improved on greedy: 740 vs 450 (64.4% improvement)
+  Both items consolidated at BestBuy to trigger $100 threshold bonus of 500 miles.
+  PASS — this validates the order-level MILP correctly captures bonus consolidation.
+
+Test 4 — Budget constraint:
+  curl -s -X POST http://localhost:4000/api/basket -H "Content-Type: application/json" \
+    -d '{"items":[{"name":"Item A","p_list":300},{"name":"Item B","p_list":300}],"category":"Electronics","card_tier":"none","budget":400,"tax_rate":0}'
+  -> greedy.total_spend: 300 (only 1 item assigned)
+     greedy.feasible: false
+     greedy.assignments: 1 item (Item A->Nike/mpx)
+  PASS
+
+Test 5 — /basket/status for unknown job_id:
+  curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/api/basket/status/nonexistent-job-id
+  -> 404
+  PASS
+
+Test 6 — Julia /basket endpoint directly (confirm fast greedy):
+  time curl -s -X POST http://localhost:5000/basket -H "Content-Type: application/json" \
+    -d '{"items":[{"name":"TV","p_list":500}],"category":"Electronics","card_tier":"none","budget":1000,"tax_rate":0.0}'
+  -> Response in 0.049s (49ms real wall clock time)
+     job_id present, greedy populated with 1 assignment
+  PASS
+
+
+GIT
+---
+Branch:  claude/milp-basket-phase-8
+Commit:  (see git log after push)
+Message: "Phase 8: Order-level MILP basket optimizer with two-phase async response"
+Tag:     v0.8.0 (local — tag push may return 403 due to Claude Code git proxy)
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 8 (per scope constraints):
+  Dual variables or sensitivity duals from the MILP (v3-spec section 5.3, option 2: removed)
+  Breakpoint sweep sensitivity analysis (Phase 9)
+  Three-axis Pareto frontier (v3-spec section 10, deferred)
+  /score or /rank endpoint changes (basket is independent)
+  Pagination on /api/basket or /api/rank
+  Database persistence for basket job state (in-memory only)
+  Item-level MILP variables (uses order-level x[i,o] as required)
+  Any call to dual(), shadow_price(), or dual-related JuMP functions
+  Full rewrite of App.jsx (split BasketTab into separate file instead)
+
+NOT changed in Phase 8:
+  types.jl, scoring.jl, bonus.jl, database.jl — unchanged
+  All 140 prior tests pass without modification
+  SQLite schema unchanged
+  Seed data unchanged
+  /score and /rank response shapes unchanged
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+
+2. JuMP v1.30.0 and HiGHS v1.22.2 resolved without version conflicts.
+   Both packages were already in Project.toml from a prior session.
+
+3. HiGHS WAS available in the test environment. All MILP tests ran
+   successfully without skipping. The try/catch guard in test_phase8.jl
+   exists but was not triggered.
+
+4. Test 3 (bonus threshold consolidation) CONFIRMED the MILP improves
+   on greedy: 740 miles (MILP) vs 450 miles (greedy), a 64.4% improvement.
+   The MILP correctly consolidates two $60 items at BestBuy to trigger the
+   $100-threshold flat_tiered bonus of 500 miles.
+
+5. App.jsx final line count: 1100. BasketTab was split into a separate
+   component file (frontend/src/BasketTab.jsx, ~250 lines) to keep
+   App.jsx under control. Only 3 targeted edits were made to App.jsx:
+   import, tab button, and rendering.
+
+6. BASKET_JOBS is an in-memory Dict in the Julia server process. Jobs
+   are lost on server restart. This is acceptable for a personal tool.
+
+7. The MILP uses order-level decision variables: x[i,o] (item to order),
+   y[o] (order active), z[t] (bonus tier active), s[o] (order subtotal).
+   Each order has a fixed (retailer, path) pair. This is the correct
+   formulation per v3-spec section 5.1.
+
+8. Cross-retailer stacked paths (buy GC at retailer A, shop at retailer B)
+   are NOT modeled in the basket MILP. Only same-retailer stacked paths
+   are included. This keeps the candidate order count manageable. Extending
+   this would require O(N^2) candidate orders for stacked paths.
+
+9. The greedy solver sorts items by miles-per-dollar descending before
+   assigning, so when budget is tight, the highest-value items are
+   prioritized.
+
+10. tax_rate in the basket endpoint is passed directly to SpendVector.
+    The bridge converts percentage to decimal (same as /api/score and
+    /api/rank). When calling Julia directly, pass decimal (e.g., 0.08).
+
+11. The MILP time_limit defaults to 28 seconds, leaving 2 seconds of
+    buffer within the 30-second bridge timeout. The solver attribute
+    mip_rel_gap is set to 0.01 (1% optimality gap tolerance).
