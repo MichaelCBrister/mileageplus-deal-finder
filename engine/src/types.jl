@@ -160,8 +160,28 @@ struct ScoreResult
     portal_miles::Float64
     card_miles::Float64
     bonus_miles::Float64
+    mpx_miles::Float64     # MPX app miles (0.0 for direct path)
     total_miles::Float64
     mpd::Float64           # miles per dollar = total_miles / p_cash
     risk_class::RiskClass
     spend::SpendVector
+    retailer_name::String  # display: primary retailer name
+    gc_source::String      # display: gift card source retailer (stacked path)
+    destination::String    # display: portal destination retailer (stacked path)
+end
+
+"""
+    ScoreResult(path, portal, card, bonus, mpx, total, mpd, risk, spend;
+                retailer_name="", gc_source="", destination="")
+
+Convenience constructor with keyword defaults for display fields.
+"""
+function ScoreResult(
+    path::PathType, portal_miles::Float64, card_miles::Float64,
+    bonus_miles::Float64, mpx_miles::Float64, total_miles::Float64,
+    mpd::Float64, risk_class::RiskClass, spend::SpendVector;
+    retailer_name::String = "", gc_source::String = "", destination::String = ""
+)
+    return ScoreResult(path, portal_miles, card_miles, bonus_miles, mpx_miles,
+                       total_miles, mpd, risk_class, spend, retailer_name, gc_source, destination)
 end

@@ -1,6 +1,5 @@
-# scoring.jl — score_direct (Phase 1 only)
-# MPX and Stacked paths are implemented in Phase 4.
-# Per v3-spec.md §2.2 (Path 1: Direct) and §2.4 (Risk Classification)
+# scoring.jl — score_direct, score_mpx, score_stacked, rank_all
+# Per v3-spec.md §2.2 (Paths 1–3), §2.4 (Risk Classification), §7.3 (Ranking)
 
 # ---------------------------------------------------------------------------
 # risk_class
@@ -98,5 +97,295 @@ function score_direct(
     # MPD: miles per dollar of cash outflow (p_cash)
     mpd = spend.p_cash > 0.0 ? total / spend.p_cash : 0.0
 
-    return ScoreResult(direct, portal_miles, card_miles, bonus_miles, total, mpd, rc, spend)
+    return ScoreResult(direct, portal_miles, card_miles, bonus_miles, 0.0, total, mpd, rc, spend;
+                       retailer_name = retailer.name)
+end
+
+# ---------------------------------------------------------------------------
+# worst_risk — severity ordering for combining risk classes
+# ---------------------------------------------------------------------------
+
+"""
+    worst_risk(a, b) → RiskClass
+
+Returns the more severe of two risk classes.
+Severity: excluded > uncertain > confirmed.
+"""
+function worst_risk(a::RiskClass, b::RiskClass)::RiskClass
+    # excluded=2, uncertain=1, confirmed=0 per @enum ordering
+    return Int(a) >= Int(b) ? a : b
+end
+
+# ---------------------------------------------------------------------------
+# risk_priority — numeric ordering for tiebreaking (lower = better)
+# ---------------------------------------------------------------------------
+
+function risk_priority(rc::RiskClass)::Int
+    if rc == confirmed
+        return 0
+    elseif rc == uncertain
+        return 1
+    else
+        return 2
+    end
+end
+
+# ---------------------------------------------------------------------------
+# classify_category_from_tc — pure function for risk classification
+# Used by scoring functions to avoid database calls.
+# Mirrors classify_category in database.jl.
+# ---------------------------------------------------------------------------
+
+"""
+    classify_category_from_tc(category, inclusions_str, exclusions_str, confidence) → RiskClass
+
+String-matching risk classification of a category against comma-separated
+inclusion/exclusion lists. Returns :confirmed if the category matches an
+inclusion and not an exclusion. Returns :excluded if it matches an exclusion
+or doesn't match any inclusion. Returns :uncertain if confidence < 0.8 or no
+clear match.
+"""
+function classify_category_from_tc(category::String, inclusions_str::String,
+                                    exclusions_str::String, confidence::Float64)::RiskClass
+    if confidence < 0.8
+        return uncertain
+    end
+    cat_lower = lowercase(strip(category))
+    if isempty(cat_lower)
+        return uncertain
+    end
+
+    exclusions = [lowercase(strip(x)) for x in split(exclusions_str, ",") if !isempty(strip(x))]
+    inclusions = [lowercase(strip(x)) for x in split(inclusions_str, ",") if !isempty(strip(x))]
+
+    for exc in exclusions
+        if cat_lower == exc
+            return excluded
+        end
+    end
+
+    if !isempty(inclusions)
+        for inc in inclusions
+            if cat_lower == inc
+                return confirmed
+            end
+        end
+        # DECISION: category not in inclusions but also not in exclusions →
+        # uncertain (not excluded). The portal miles are included with a warning.
+        # This matches the task's intent: "Electronics is not in Walmart's exclusions"
+        # means portal miles should be included, not zeroed.
+        return uncertain
+    end
+
+    return uncertain
+end
+
+# ---------------------------------------------------------------------------
+# score_mpx — Phase 4: MPX (MileagePlus X) gift card path
+# ---------------------------------------------------------------------------
+
+"""
+    score_mpx(retailer_data, spend, card) → ScoreResult
+
+Score an MPX path purchase: buy eGift card through the MPX app.
+
+Formula (v3-spec.md §2.2 Path 2):
+  mpx_miles         = p_cash × m_r
+  card_miles         = p_cash × c_r(k)
+  chase_bonus_miles  = 0.25 × mpx_miles  (25% Chase primary cardmember bonus)
+  total              = mpx_miles + card_miles + chase_bonus_miles
+
+CRITICAL: card_miles use p_cash (the posted gift card transaction).
+The 25% Chase bonus is on MPX miles, stored in bonus field.
+MPX is the intended gift card channel — risk is always :confirmed.
+Gift cards are NOT purchased through the portal.
+
+retailer_data — RetailerData (from database.jl) for the MPX gift card retailer
+spend         — SpendVector (p_cash is the gift card purchase amount)
+card          — CardTier
+"""
+function score_mpx(
+    retailer_data,  # RetailerData — using duck typing to avoid dependency on database.jl struct
+    spend::SpendVector,
+    card::CardTier
+)::ScoreResult
+    mpx_rate = retailer_data.retailer.mpx_rate
+    if mpx_rate === nothing || mpx_rate == 0.0
+        return ScoreResult(mpx, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, confirmed, spend;
+                           retailer_name = retailer_data.retailer.name)
+    end
+
+    mpx_miles = spend.p_cash * Float64(mpx_rate)
+    card_miles = spend.p_cash * card.base_rate  # card earns on posted transaction (gift card purchase)
+    chase_bonus_miles = 0.25 * mpx_miles        # 25% Chase United primary cardmember bonus
+
+    total = mpx_miles + card_miles + chase_bonus_miles
+    mpd = spend.p_cash > 0.0 ? total / spend.p_cash : 0.0
+
+    # portal=0 (MPX is not the portal), card=card_miles, bonus=chase_bonus, mpx=mpx_miles
+    # Risk is always :confirmed — MPX is the intended channel
+    return ScoreResult(mpx, 0.0, card_miles, chase_bonus_miles, mpx_miles, total, mpd, confirmed, spend;
+                       retailer_name = retailer_data.retailer.name)
+end
+
+# ---------------------------------------------------------------------------
+# score_stacked — Phase 4: Two-leg stacked path (MPX + Portal)
+# ---------------------------------------------------------------------------
+
+"""
+    score_stacked(gc_retailer_data, dest_retailer_data, category, spend, card) → ScoreResult
+
+Score a Stacked path: buy gift card via MPX (Leg 1), then shop through portal
+paying with gift card (Leg 2).
+
+Leg 1 (MPX gift card purchase using gc_retailer_data):
+  leg1_mpx          = p_cash × gc_mpx_rate
+  leg1_card          = p_cash × c_r(k)
+  leg1_chase_bonus   = 0.25 × leg1_mpx
+
+Leg 2 (Portal purchase with gift card at dest_retailer_data):
+  If gc_portal_eligible = false: Leg 2 contributes nothing (stacked = MPX)
+  If gc_portal_eligible = true and not excluded:
+    leg2_portal = p_portal × dest_base_rate
+    leg2_bonus  = compute_bonus(dest_bonus, p_portal, dest_base_rate)
+  NO card miles on Leg 2 — purchase paid with gift card, not credit card.
+
+CRITICAL INVARIANT: Card miles are ONLY earned on Leg 1 (the gift card purchase).
+Risk class for Leg 2 comes from dest_retailer_data T&C rules, not from δ multiplication.
+
+gc_retailer_data   — RetailerData for the gift card source retailer
+dest_retailer_data — RetailerData for the portal destination retailer
+category           — category string for risk classification
+spend              — SpendVector
+card               — CardTier
+"""
+function score_stacked(
+    gc_retailer_data,
+    dest_retailer_data,
+    category::String,
+    spend::SpendVector,
+    card::CardTier
+)::ScoreResult
+    gc_mpx_rate = gc_retailer_data.retailer.mpx_rate
+    if gc_mpx_rate === nothing || gc_mpx_rate == 0.0
+        return ScoreResult(stacked, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, confirmed, spend;
+                           retailer_name = dest_retailer_data.retailer.name,
+                           gc_source = gc_retailer_data.retailer.name,
+                           destination = dest_retailer_data.retailer.name)
+    end
+
+    # Leg 1: MPX gift card purchase
+    leg1_mpx = spend.p_cash * Float64(gc_mpx_rate)
+    leg1_card = spend.p_cash * card.base_rate
+    leg1_chase_bonus = 0.25 * leg1_mpx
+
+    # Leg 2: Portal purchase with gift card
+    leg2_portal = 0.0
+    leg2_bonus = 0.0
+    leg2_risk = confirmed  # default if no Leg 2
+
+    if dest_retailer_data.retailer.gc_portal_eligible
+        # Determine dest risk class from T&C rules
+        dest_risk = classify_category_from_tc(
+            category,
+            dest_retailer_data.tc_inclusions,
+            dest_retailer_data.tc_exclusions,
+            dest_retailer_data.tc_confidence
+        )
+
+        if dest_risk != excluded
+            δ = portal_delta(dest_risk)
+            leg2_portal = δ * spend.p_portal * dest_retailer_data.retailer.base_rate
+            leg2_bonus = total_bonus_miles(dest_retailer_data.bonuses, spend.p_portal, dest_retailer_data.retailer.base_rate)
+            leg2_risk = dest_risk
+        end
+        # If dest_risk == excluded: Leg 2 contributes 0 miles, leg2_risk stays :confirmed
+        # because there are no uncertain miles in the total. The excluded category
+        # means "don't attempt Leg 2", not "the whole stacked path is risky".
+    end
+
+    stacked_total = leg1_mpx + leg1_card + leg1_chase_bonus + leg2_portal + leg2_bonus
+    mpd = spend.p_cash > 0.0 ? stacked_total / spend.p_cash : 0.0
+
+    # Combined risk: if gc_portal_eligible is false, pure MPX → confirmed
+    # If Leg 2 is excluded (0 miles), risk is still confirmed (no risky miles in total)
+    # If Leg 2 is uncertain, combine with worst_risk
+    combined_risk = worst_risk(confirmed, leg2_risk)
+
+    return ScoreResult(stacked, leg2_portal, leg1_card, (leg1_chase_bonus + leg2_bonus),
+                       leg1_mpx, stacked_total, mpd, combined_risk, spend;
+                       retailer_name = dest_retailer_data.retailer.name,
+                       gc_source = gc_retailer_data.retailer.name,
+                       destination = dest_retailer_data.retailer.name)
+end
+
+# ---------------------------------------------------------------------------
+# rank_all — Phase 4: score all paths across all retailers
+# Per v3-spec.md §7.3
+# ---------------------------------------------------------------------------
+
+"""
+    rank_all(retailers, category, spend, card; risk_filter=nothing) → Vector{ScoreResult}
+
+Scores all earning paths (Direct, MPX, Stacked) across all retailers in a
+single call. Returns results sorted descending by total_miles, with
+risk priority (confirmed first) as tiebreaker.
+
+retailers   — Vector of RetailerData (all retailers from current snapshot)
+category    — product category for risk classification
+spend       — SpendVector
+card        — CardTier
+risk_filter — optional Set{RiskClass}; if provided, only include results with
+              risk_class in the set
+"""
+function rank_all(
+    retailers::Vector,  # Vector of RetailerData
+    category::String,
+    spend::SpendVector,
+    card::CardTier;
+    risk_filter::Union{Nothing, Set{RiskClass}} = nothing
+)::Vector{ScoreResult}
+    results = ScoreResult[]
+
+    for r in retailers
+        # Determine risk class for this retailer + category
+        rc = classify_category_from_tc(
+            category, r.tc_inclusions, r.tc_exclusions, r.tc_confidence
+        )
+
+        # Build an effective Retailer with the correct risk class for score_direct
+        eff_retailer = Retailer(
+            r.retailer.id, r.retailer.name, r.retailer.base_rate,
+            r.retailer.mpx_rate, r.retailer.gc_portal_eligible, rc, category
+        )
+
+        # Direct path
+        push!(results, score_direct(eff_retailer, spend, card, r.bonuses;
+                                     product_query = category))
+
+        # MPX path (if retailer has an MPX rate)
+        mpx_rate = r.retailer.mpx_rate
+        if mpx_rate !== nothing && mpx_rate > 0.0
+            push!(results, score_mpx(r, spend, card))
+        end
+
+        # Stacked path: this retailer as GC source → each gc_portal_eligible dest
+        if mpx_rate !== nothing && mpx_rate > 0.0
+            for dest in retailers
+                if dest.retailer.gc_portal_eligible
+                    push!(results, score_stacked(r, dest, category, spend, card))
+                end
+            end
+        end
+    end
+
+    # Apply risk filter if provided
+    if risk_filter !== nothing
+        filter!(r -> r.risk_class in risk_filter, results)
+    end
+
+    # Sort descending by total_miles, then ascending by risk priority (confirmed first)
+    sort!(results; by = r -> (-r.total_miles, risk_priority(r.risk_class)))
+
+    return results
 end

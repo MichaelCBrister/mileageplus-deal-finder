@@ -271,6 +271,35 @@ function classify_category(category::String, inclusions_str::String, exclusions_
 end
 
 # ---------------------------------------------------------------------------
+# Load all retailers for a snapshot
+# ---------------------------------------------------------------------------
+
+"""
+    load_all_retailers(db, snapshot_id, category) → Vector{RetailerData}
+
+Loads all retailers from the given snapshot, including their rates, bonuses,
+T&C rules, and the risk class for the given category.
+"""
+function load_all_retailers(db::SQLite.DB, snapshot_id::String, category::String)::Vector{RetailerData}
+    # Get all retailer names that have rates in this snapshot
+    rows = SQLite.DBInterface.execute(db,
+        """SELECT DISTINCT r.name FROM retailers r
+           JOIN retailer_rates rr ON r.retailer_id = rr.retailer_id
+           WHERE rr.snapshot_id = ?""",
+        (snapshot_id,)
+    ) |> SQLite.rowtable
+
+    retailers = RetailerData[]
+    for row in rows
+        rd = load_retailer(db, snapshot_id, String(row.name))
+        if rd !== nothing
+            push!(retailers, rd)
+        end
+    end
+    return retailers
+end
+
+# ---------------------------------------------------------------------------
 # Process constraints
 # ---------------------------------------------------------------------------
 
