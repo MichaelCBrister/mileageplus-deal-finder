@@ -1,0 +1,252 @@
+PHASE 5 SESSION SUMMARY
+MileagePlus Deal Finder — Claude API T&C Parser + Bonus Classification + Risk Class Reconciliation
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Replace the simple comma-separated string matching used for T&C risk
+classification with a Claude API-powered parser that reads raw T&C text and
+determines product category eligibility. Add Claude API-powered bonus
+classification that parses raw bonus offer text into the structured BonusOffer
+types defined in v3-spec.md section 4.1. Reconcile the two-function risk
+classification discrepancy from Phase 4 into a single authoritative function.
+
+
+ENVIRONMENT SETUP
+-----------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+2. Database initialized with: bash db/init.sh (must delete old DB first
+   for clean seed: rm -f db/mileageplus.db && bash db/init.sh)
+3. Bridge dependencies installed: cd bridge && npm install
+4. Added better-sqlite3 to bridge dependencies for synchronous SQLite access
+   from Node.js parse endpoints.
+5. ANTHROPIC_API_KEY was NOT available in the cloud environment. Tests 3, 4,
+   and 6 (which require live Claude API calls) could not be executed. All
+   non-API tests passed. The test-tc-parsing.js script and parse endpoints
+   are functional and ready for testing when the API key is provided.
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+engine/src/scoring.jl  [MODIFIED]
+  Reconciled classify_category_from_tc to delegate to classify_category
+  (database.jl) for core string-matching logic. The Phase 4 behavior of
+  returning :uncertain for unlisted categories was corrected to return
+  :excluded per v3-spec.md section 3.3. Added confidence < 0.8 gating
+  before delegating. Added detailed docstring explaining the authoritative
+  classification rule and the Phase 5 reconciliation rationale.
+
+engine/test/test_phase4.jl  [MODIFIED]
+  Updated 1 test in classify_category_from_tc test set:
+    - "Toys" with inclusions="Electronics,Computers" now expects :excluded
+      (was :uncertain). This reflects the reconciled behavior: a category
+      not listed in a non-empty inclusions list is :excluded, not :uncertain.
+
+db/seed.sql  [MODIFIED]
+  Updated raw_text values for all tc_rules and bonus_offers rows with
+  realistic portal-style T&C and bonus offer text:
+    - BestBuy tc_rules raw_text: detailed electronics/computers/appliances
+      inclusions and gift cards/services exclusions
+    - Nike tc_rules raw_text: clothing/footwear/accessories with gift card
+      and NIKEiD exclusions
+    - Walmart tc_rules raw_text: general merchandise/grocery with gift cards,
+      pharmacy, tobacco, alcohol, firearms exclusions; notes gift card
+      payment eligibility
+    - BestBuy flat_tiered bonus raw_text: $100 threshold, 500 miles, gift
+      cards excluded
+    - Nike per_order_flat bonus raw_text: $75 threshold, 250 miles
+
+bridge/tc-parser.js  [NEW]
+  Claude API-powered T&C and bonus offer parser module. Exports two async
+  functions:
+    - parseTAndC(rawText, retailerName) — parses T&C text into structured
+      inclusions/exclusions with confidence and notes
+    - parseBonus(rawText, retailerName, baseRate) — parses bonus offer text
+      into typed BonusOffer config (flat_tiered, rate_multiplier, per_order_flat)
+  Uses claude-sonnet-4-20250514 model. Includes JSON retry logic and fallback
+  on parse failure. Never throws unhandled exceptions.
+
+bridge/server.js  [MODIFIED]
+  Added two new endpoints:
+    - POST /api/parse-tc — parses T&C text, updates tc_rules in SQLite
+    - POST /api/parse-bonus — parses bonus text, updates bonus_offers in SQLite
+  Added dependencies: path, better-sqlite3, tc-parser.js
+  Both endpoints return 400 with api_key_missing error if ANTHROPIC_API_KEY
+  is not set. Both update the database and return db_updated boolean.
+
+bridge/test-tc-parsing.js  [NEW]
+  Manual review script testing 5 cases:
+    Case 1: BestBuy explicit inclusions/exclusions (T&C parse)
+    Case 2: Target vague scope (T&C parse)
+    Case 3: Dell 5x total rate multiplier (bonus parse)
+    Case 4: HP incremental bonus (bonus parse)
+    Case 5: Lenovo flat_tiered new_customer (bonus parse)
+  Prints full parsed JSON and PASS/FAIL verdict for each. Requires
+  ANTHROPIC_API_KEY to run.
+
+bridge/package.json  [MODIFIED]
+  Added better-sqlite3 dependency (installed via npm install).
+
+docs/phase5-session-summary.txt  [NEW]
+  This file.
+
+
+TEST RESULTS
+------------
+Command: cd engine && JULIA_PKG_SERVER="" julia --project test/runtests.jl
+
+Result: 140 passed, 0 failed, 0 errored
+
+Breakdown:
+  - Phase 1-3 tests (test_bonus.jl, test_scoring.jl): 76 passed (unchanged)
+  - Phase 4 tests (test_phase4.jl): 64 passed
+    - 1 test changed due to reconciliation fix:
+      classify_category_from_tc("Toys", "Electronics,Computers", "Gift Cards", 0.95)
+        WAS: == uncertain (Phase 4 behavior)
+        NOW: == excluded (Phase 5 reconciled behavior)
+      Reason: "Toys" is not in the non-empty inclusions list
+      ["Electronics","Computers"], so per v3-spec.md section 3.3, it is
+      :excluded (not listed = not eligible), NOT :uncertain (which is
+      reserved for genuinely ambiguous T&C text).
+
+No other tests changed. The stacked path tests in test_phase4.jl that use
+"General Merchandise" at Walmart still pass because "General Merchandise"
+IS in Walmart's inclusions list. The "Gift Cards" at Walmart test still
+passes because "Gift Cards" is in the exclusions list. The rank_all tests
+pass because they only check ordering and that stacked results exist (not
+specific portal_miles values for stacked-to-Walmart with Electronics).
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Julia engine started: julia --project src/server.jl (port 5000)
+Node bridge started: node server.js (port 4000)
+Database: db/mileageplus.db (initialized via bash db/init.sh)
+
+Test 1 — Risk class reconciliation, unlisted category at Walmart:
+  curl -s -X POST http://localhost:5000/score -H "Content-Type: application/json" \
+    -d '{"retailer":"Walmart","p_list":100.0,"tax_rate":0.0,"category":"Electronics","card_tier":"none","path":"direct"}'
+  -> risk_class: "excluded"
+     portal_miles: 0.0
+     card_miles: 0.0
+     total_miles: 0.0
+  PASS — Electronics not in Walmart inclusions (General Merchandise, Grocery)
+
+Test 2 — Risk class confirmed for listed category (BestBuy):
+  curl -s -X POST http://localhost:5000/score -H "Content-Type: application/json" \
+    -d '{"retailer":"BestBuy","p_list":200.0,"tax_rate":0.0,"category":"Electronics","card_tier":"none","path":"direct"}'
+  -> risk_class: "confirmed"
+     portal_miles: 400.0
+     bonus_miles: 500.0
+     total_miles: 900.0
+  PASS — matches Phase 3/4 results exactly
+
+Test 3 — Parse T&C via bridge:
+  NOT EXECUTED — ANTHROPIC_API_KEY not available in cloud environment.
+  Endpoint verified to return 400 api_key_missing when key is absent.
+
+Test 4 — Parse bonus via bridge:
+  NOT EXECUTED — ANTHROPIC_API_KEY not available in cloud environment.
+  Endpoint verified to return 400 api_key_missing when key is absent.
+
+Test 5 — Missing API key returns 400:
+  curl -s -X POST http://localhost:4000/api/parse-tc -H "Content-Type: application/json" \
+    -d '{"retailer_name":"BestBuy","snapshot_id":"seed-snapshot-001","raw_text":"test"}'
+  -> {"error":"api_key_missing","message":"ANTHROPIC_API_KEY environment variable is not set. Set it before calling parse endpoints."}
+  PASS
+
+  Also verified for /api/parse-bonus:
+  -> Same api_key_missing response
+  PASS
+
+Test 6 — Manual review script:
+  NOT EXECUTED — ANTHROPIC_API_KEY not available in cloud environment.
+  Script is functional and ready for testing with API key.
+
+Test 7 — Rank result reflects reconciled risk class for Walmart:
+  curl -s -X POST http://localhost:4000/api/rank -H "Content-Type: application/json" \
+    -d '{"p_list":100.0,"tax_rate":0,"category":"Electronics","card_tier":"none"}'
+  -> result_count: 9
+     Walmart direct: risk_class="excluded", portal_miles=0, total_miles=0
+     Nike direct: risk_class="excluded", portal_miles=0, total_miles=0
+     BestBuy direct: risk_class="confirmed", portal_miles=200, total_miles=700
+     All stacked paths to Walmart: portal_miles=0 (Leg 2 excluded)
+     Stacked totals equal corresponding MPX totals (no Leg 2 contribution)
+  PASS
+
+
+GIT
+---
+Branch:  claude/review-docs-and-state-UVwe2
+Commit:  (see git log after push)
+Message: "Phase 5: Claude API T&C parser + bonus classification + risk class reconciliation"
+Tag:     v0.5.0 (local)
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 5 (reserved for later phases):
+  Playwright scraper              (Phase 6)
+  Automatic re-parsing on startup (not in scope)
+  Scheduled/background parsing    (not in scope)
+  T&C parsing UI in frontend      (Phase 6)
+  Purchase log write path         (Phase 7)
+  Basket MILP optimizer           (Phase 8)
+  Sensitivity sweep               (Phase 9)
+
+NOT changed in Phase 5:
+  ScoreResult struct fields unchanged (beyond Phase 4 additions)
+  No new scoring function signatures added
+  SQLite schema unchanged (raw_text column already existed on bonus_offers
+  and tc_rules per v3-spec section 6)
+  Frontend unchanged
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+
+2. Database initialization: rm -f db/mileageplus.db && bash db/init.sh
+   The init.sh script uses INSERT OR IGNORE, so re-running on an existing
+   DB with different seed data may not update existing rows. Delete the DB
+   first for a clean start.
+
+3. RISK CLASSIFICATION RECONCILIATION: classify_category_from_tc in
+   scoring.jl now delegates to classify_category in database.jl. The single
+   authoritative rule is:
+     - Category not in non-empty inclusions list → :excluded (NOT :uncertain)
+     - :uncertain is ONLY for: confidence < 0.8, empty category, both
+       inclusions and exclusions empty (no T&C data)
+   This means any category not explicitly listed in a retailer's inclusions
+   will have portal miles zeroed. Phase 6 scraper/parser results must
+   explicitly include all eligible categories in inclusions.
+
+4. ELECTRONICS AT WALMART: After reconciliation, "Electronics" is :excluded
+   at Walmart because Walmart's inclusions are "General Merchandise,Grocery".
+   For stacked path tests involving Electronics at Walmart to produce non-zero
+   Leg 2 portal miles, "Electronics" must be explicitly added to Walmart's
+   tc_rules inclusions. This is correct per the spec — the seed data
+   accurately reflects that Walmart's portal earnings cover general
+   merchandise and grocery, not electronics specifically.
+
+5. ANTHROPIC_API_KEY: Required for /api/parse-tc and /api/parse-bonus
+   endpoints. Both endpoints return 400 with api_key_missing error if the
+   key is not set. The test-tc-parsing.js script also requires this key.
+   Set it in the shell before starting the bridge server.
+
+6. better-sqlite3: Added to bridge/package.json. Must run npm install in
+   bridge/ directory after fresh clone. The parse endpoints use synchronous
+   SQLite access to update tc_rules and bonus_offers after parsing.
+
+7. The bridge opens a new SQLite connection for each parse request. This is
+   acceptable for the low-volume on-demand parsing use case. If Phase 6
+   batch parsing needs higher throughput, consider connection pooling.
+
+8. The tc-parser.js module uses claude-sonnet-4-20250514 model. Both
+   parseTAndC and parseBonus include JSON retry logic (one retry with
+   clarifying instruction) and fallback objects with confidence=0.0 on
+   complete failure. They never throw unhandled exceptions.

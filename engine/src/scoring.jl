@@ -139,45 +139,31 @@ end
 """
     classify_category_from_tc(category, inclusions_str, exclusions_str, confidence) → RiskClass
 
-String-matching risk classification of a category against comma-separated
-inclusion/exclusion lists. Returns :confirmed if the category matches an
-inclusion and not an exclusion. Returns :excluded if it matches an exclusion
-or doesn't match any inclusion. Returns :uncertain if confidence < 0.8 or no
-clear match.
+Risk classification of a category against comma-separated inclusion/exclusion lists,
+with confidence gating. Delegates to classify_category (database.jl) for the core
+string-matching logic. This is the single authoritative classification rule:
+
+  - If confidence < 0.8: return :uncertain (T&C data not reliable)
+  - If category matches an explicit exclusion: return :excluded
+  - If inclusions non-empty and category matches no inclusion: return :excluded
+  - If category matches an inclusion and no exclusion: return :confirmed
+  - If both inclusions and exclusions are empty: return :uncertain (no T&C data)
+  - If category matches both inclusion and exclusion (contradictory): return :excluded
+    (exclusions checked first in classify_category)
+
+Phase 5 reconciliation: this function now produces the same results as
+classify_category in database.jl (plus confidence gating). The Phase 4
+behavior of returning :uncertain for unlisted categories was incorrect per
+v3-spec.md §3.3 — :uncertain is reserved for genuinely ambiguous T&C text,
+not for categories absent from a well-defined inclusion list.
 """
 function classify_category_from_tc(category::String, inclusions_str::String,
                                     exclusions_str::String, confidence::Float64)::RiskClass
     if confidence < 0.8
         return uncertain
     end
-    cat_lower = lowercase(strip(category))
-    if isempty(cat_lower)
-        return uncertain
-    end
-
-    exclusions = [lowercase(strip(x)) for x in split(exclusions_str, ",") if !isempty(strip(x))]
-    inclusions = [lowercase(strip(x)) for x in split(inclusions_str, ",") if !isempty(strip(x))]
-
-    for exc in exclusions
-        if cat_lower == exc
-            return excluded
-        end
-    end
-
-    if !isempty(inclusions)
-        for inc in inclusions
-            if cat_lower == inc
-                return confirmed
-            end
-        end
-        # DECISION: category not in inclusions but also not in exclusions →
-        # uncertain (not excluded). The portal miles are included with a warning.
-        # This matches the task's intent: "Electronics is not in Walmart's exclusions"
-        # means portal miles should be included, not zeroed.
-        return uncertain
-    end
-
-    return uncertain
+    # Delegate to the shared classify_category logic in database.jl
+    return classify_category(category, inclusions_str, exclusions_str)
 end
 
 # ---------------------------------------------------------------------------
