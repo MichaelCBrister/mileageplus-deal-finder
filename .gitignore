@@ -11,6 +11,9 @@ dist/
 .env
 *.log
 
+# Dev logs
+logs/
+
 # SQLite
 *.db
 *.db-journal

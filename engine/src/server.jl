@@ -15,6 +15,11 @@ include("scoring.jl")
 # ---------------------------------------------------------------------------
 
 const CARD_TIERS = Dict{String, CardTier}(
+    "none" => CardTier(
+        "No Chase United card",
+        0.0,
+        Dict{String, Float64}()
+    ),
     "explorer" => CardTier(
         "United Explorer",
         1.0,
@@ -82,7 +87,7 @@ const FIXTURE_RETAILERS = Dict{String, FixtureRetailer}(
     "bestbuy" => FixtureRetailer(
         Retailer(2, "Best Buy", 1.0, nothing, false, confirmed, "electronics"),
         BonusOffer[PerOrderFlatBonus(2, 500.0, 50.0)],
-        Dict{String, RiskClass}()
+        Dict{String, RiskClass}("appliances" => uncertain)
     ),
     "udemy" => FixtureRetailer(
         Retailer(3, "Udemy", 8.0, nothing, false, confirmed, "education"),
@@ -209,12 +214,17 @@ function handle_score(req::HTTP.Request)::HTTP.Response
 
     # Build a card tier that reflects the fixture's per-retailer card rate
     # by injecting the fixture rate into the category_rates for this retailer's category.
-    fixture_card_rate = get(FIXTURE_CARD_RATES, key, base_card.base_rate)
-    card = CardTier(
-        base_card.name,
-        fixture_card_rate,  # use fixture card rate as base for this retailer
-        base_card.category_rates
-    )
+    # When card_tier is "none" (base_rate=0.0), skip the fixture override — no card = no card miles.
+    if base_card.base_rate == 0.0
+        card = base_card
+    else
+        fixture_card_rate = get(FIXTURE_CARD_RATES, key, base_card.base_rate)
+        card = CardTier(
+            base_card.name,
+            fixture_card_rate,  # use fixture card rate as base for this retailer
+            base_card.category_rates
+        )
+    end
 
     # Build SpendVector
     spend = SpendVector(params.price; tax_rate = params.tax_rate)
