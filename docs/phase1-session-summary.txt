@@ -1,0 +1,226 @@
+PHASE 1 SESSION SUMMARY
+MileagePlus Deal Finder — Julia Engine
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Implement Phase 1 of the MileagePlus Deal Finder:
+  - Julia engine skeleton
+  - SpendVector and type hierarchy
+  - score_direct function
+  - HTTP server on port 5000
+  - Unit tests (76 total)
+  - Acceptance test verification
+
+
+ENVIRONMENT SETUP
+-----------------
+Julia was not installed. julialang.org and julialang-s3.julialang.org
+are blocked by the network proxy.
+
+Workaround:
+  1. Downloaded Miniconda3 from repo.anaconda.com (allowed host)
+  2. Installed Miniconda to /opt/miniconda3
+  3. Installed Julia 1.10.4 via: conda install -c conda-forge julia=1.10
+  4. Julia binary: /opt/miniconda3/bin/julia
+
+Dependency issue:
+  HTTP.jl depends on MbedTLS, which loaded the conda-installed
+  libmbedcrypto.so 4.0.0. That version removed mbedtls_strerror,
+  causing a load error.
+
+  Fix: conda install -c conda-forge "mbedtls=2.*"
+  Result: mbedtls downgraded to 2.27.0, HTTP.jl loads correctly.
+
+Julia dependencies installed via:
+  JULIA_PKG_SERVER="" julia --project=. -e 'using Pkg; Pkg.instantiate()'
+  (JULIA_PKG_SERVER="" required to avoid 403 from pkg.julialang.org)
+
+Registry was cloned from https://github.com/JuliaRegistries/General.git
+(GitHub API is an allowed host).
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+engine/src/MileagePlusDealFinder.jl  [NEW]
+  Module entry point required by Julia's Pkg system.
+  Includes types.jl, bonus.jl, scoring.jl and exports all public symbols.
+
+engine/src/types.jl  [IMPLEMENTED]
+  - SpendVector struct with 5 fields: p_list, p_portal, p_card, p_cash,
+    v_residual
+  - SpendVector convenience constructor: takes p_list, tax_rate (default
+    0.08), optional gc_denom for gift card paths
+  - RiskClass enum: confirmed, uncertain, excluded
+  - PathType enum: direct, mpx, stacked
+  - BonusSemantic enum: total, incremental, up_to, flat_bonus
+  - CardTier struct + card_rate() lookup function
+  - Retailer struct
+  - Abstract BonusOffer with 3 concrete subtypes:
+      FlatTieredBonus     — highest-qualifying-tier flat miles
+      RateMultiplierBonus — modifies portal earn rate via semantics dispatch
+      PerOrderFlatBonus   — flat miles per order if min_spend met
+  - ScoreResult struct
+
+engine/src/bonus.jl  [IMPLEMENTED]
+  - compute_bonus(::FlatTieredBonus, spend, base_rate)
+  - compute_bonus(::RateMultiplierBonus, spend, base_rate)
+      dispatches on semantics:
+        :total       -> max(0, rate - base_rate) * spend
+        :incremental -> rate * spend
+        :up_to       -> max(0, rate - base_rate) * spend
+        :flat_bonus  -> rate (flat miles)
+  - compute_bonus(::PerOrderFlatBonus, spend, base_rate)
+  - total_bonus_miles(bonuses, spend, base_rate) — sums over a vector
+
+engine/src/scoring.jl  [IMPLEMENTED]
+  - risk_class(retailer, product_query) -> RiskClass
+  - portal_delta(rc) -> Float64
+      confirmed  -> 1.0
+      uncertain  -> 1.0 (included with warning; risk_class column warns user)
+      excluded   -> 0.0
+  - score_direct(retailer, spend, card, bonuses; product_query) -> ScoreResult
+      CRITICAL INVARIANT: card_miles = p_card * c_r(k), NO delta factor
+      portal_miles = delta * p_portal * base_rate
+      bonus_miles  = 0 when excluded, total_bonus_miles otherwise
+      MPX and Stacked paths NOT implemented (Phase 4)
+
+engine/src/server.jl  [IMPLEMENTED]
+  HTTP.jl server on port 5000.
+
+  Endpoints:
+    GET  /health  -> {"status": "ok"}
+    POST /score   -> ScoreResult JSON
+
+  /score request body:
+    retailer      (string, required)
+    product_query (string, optional, default "")
+    price         (float, required)
+    card_tier     (string, optional, default "explorer")
+    tax_rate      (float, optional, default 0.08)
+
+  Fixture card tiers: explorer, quest, club
+
+  Fixture retailers (hardcoded, no DB — DB integration is Phase 3):
+    Macy's    base=5.0  card=2.0  RateMultiplierBonus rate=8.0 :total
+    Best Buy  base=1.0  card=2.0  PerOrderFlatBonus 500mi min=$50
+    Udemy     base=8.0  card=1.5  no bonus
+    Nike      base=3.0  card=2.0  FlatTieredBonus [(100,200),(200,500)]
+    Sephora   base=4.0  card=2.0  no bonus
+                                  risk override: "electronics" -> uncertain
+
+engine/test/test_bonus.jl  [IMPLEMENTED]
+  Unit tests for all compute_bonus dispatch paths.
+
+engine/test/test_scoring.jl  [IMPLEMENTED]
+  Unit tests for SpendVector and score_direct.
+
+engine/test/runtests.jl  [IMPLEMENTED]
+  Test runner — includes types.jl, bonus.jl, scoring.jl directly
+  (no HTTP dependency needed for tests).
+
+
+TEST RESULTS
+------------
+Command: JULIA_PKG_SERVER="" julia --project=. test/runtests.jl
+
+Result: 76 passed, 0 failed, 0 errored
+
+Test groups:
+  FlatTieredBonus                                    8 passed
+  RateMultiplierBonus — semantics dispatch          11 passed
+  PerOrderFlatBonus                                  4 passed
+  total_bonus_miles — multiple bonuses               2 passed
+  SpendVector                                       17 passed
+  score_direct — basic correctness                   7 passed
+  score_direct — card miles independent of delta     7 passed
+  score_direct — portal miles by risk class          5 passed
+  score_direct — with bonuses                        6 passed
+  score_direct — fixture: Macy's                     6 passed
+  score_direct — fixture: Sephora electronics        3 passed
+
+One bug found and fixed during testing:
+  bonus.jl had a second overload for total_bonus_miles(::Vector{BonusOffer}, ...)
+  that always returned 0.0. Julia dispatched this more-specific method over the
+  generic Vector{<:BonusOffer} version when called with heterogeneous bonus lists.
+  Fixed by removing the extraneous overload.
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Server started: julia --project=. src/server.jl (port 5000)
+
+Test 1 — /health:
+  curl http://localhost:5000/health
+  -> {"status":"ok"}  PASS
+
+Test 2 — Macy's shoes $100 (confirms card_miles > 0):
+  POST /score {"retailer":"Macys","product_query":"shoes","price":100.0,"card_tier":"explorer"}
+  -> portal_miles: 500.0
+     card_miles:   216.0   (> 0, PASS — invariant confirmed)
+     bonus_miles:  300.0
+     total_miles:  1016.0
+     risk_class:   "confirmed"
+     mpd:          9.41
+
+Test 3 — Sephora electronics $100 (confirms uncertain risk + card_miles > 0):
+  POST /score {"retailer":"Sephora","product_query":"electronics","price":100.0,"card_tier":"explorer"}
+  -> portal_miles: 400.0   (included — uncertain != excluded)
+     card_miles:   216.0   (> 0, PASS — invariant confirmed)
+     bonus_miles:  0.0
+     total_miles:  616.0
+     risk_class:   "uncertain"   PASS
+
+Additional spot-checks:
+  Best Buy $100  -> bonus_miles=500 (PerOrderFlat triggered, 100 >= 50)
+  Nike $250      -> bonus_miles=500 (FlatTiered upper tier, 250 >= 200)
+  Udemy $100     -> portal_miles=800, card_miles=162, bonus_miles=0
+
+
+GIT
+---
+Branch:  claude/julia-engine-phase-1-RwcS6
+Commit:  97b6910925b60065b34f49564c846b60721d8d55
+Message: "Phase 1: Julia engine skeleton + score_direct + HTTP server"
+
+Tag v0.1.0 created locally. Remote push of tag returned 403 (remote
+does not allow tag pushes through the Claude Code git proxy). Tag exists
+locally; commit is on the pushed branch.
+
+PR: https://github.com/MichaelCBrister/mileageplus-deal-finder/pull/1
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 1 (reserved for later phases):
+  MPX path          (Phase 4)
+  Stacked path      (Phase 4)
+  rank_all          (Phase 4)
+  SQLite / DB reads (Phase 3)
+  Node.js bridge    (Phase 2)
+  React frontend    (Phase 2)
+  MILP basket       (Phase 8)
+  Sensitivity sweep (Phase 9)
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /opt/miniconda3/bin/julia (installed via conda, not juliaup)
+   julialang.org is a blocked host in this environment.
+
+2. Always run Julia with: JULIA_PKG_SERVER=""
+   pkg.julialang.org is also blocked; without this env var, Pkg hangs on
+   first use trying to contact the package server.
+
+3. If HTTP.jl fails with "could not load symbol mbedtls_strerror":
+   Run: conda install -c conda-forge "mbedtls=2.*"
+   This downgrades mbedtls from 4.x (conda default) to 2.x (Julia-compatible).
+
+4. If Julia tests hang during precompilation, clean stale pidfiles:
+   find ~/.julia/compiled -name "*.pidfile" -delete
+
+5. The #1 invariant in the codebase: card_miles = p_card * c_r(k) with NO
+   delta factor. Portal risk class NEVER affects card mile earning.
+   Tested explicitly in test_scoring.jl.
