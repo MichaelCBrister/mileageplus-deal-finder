@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import BasketTab from './BasketTab';
 
 const CARD_TIERS = [
   { value: 'none', label: 'No Chase United card' },
@@ -35,6 +36,12 @@ function App() {
           Rank
         </button>
         <button
+          style={tab === 'basket' ? styles.tabActive : styles.tab}
+          onClick={() => setTab('basket')}
+        >
+          Basket
+        </button>
+        <button
           style={tab === 'purchases' ? styles.tabActive : styles.tab}
           onClick={() => setTab('purchases')}
         >
@@ -47,7 +54,7 @@ function App() {
           Scraper
         </button>
       </div>
-      {tab === 'score' ? <ScorePanel /> : tab === 'rank' ? <RankPanel /> : tab === 'purchases' ? <PurchasesPanel /> : <ScraperPanel />}
+      {tab === 'score' ? <ScorePanel /> : tab === 'rank' ? <RankPanel /> : tab === 'basket' ? <BasketTab /> : tab === 'purchases' ? <PurchasesPanel /> : <ScraperPanel />}
     </div>
   );
 }

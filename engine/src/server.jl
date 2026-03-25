@@ -7,11 +7,13 @@ using HTTP
 using JSON3
 using SQLite
 using Dates
+using UUIDs
 
 include("types.jl")
 include("bonus.jl")
 include("scoring.jl")
 include("database.jl")
+include("basket.jl")
 
 # ---------------------------------------------------------------------------
 # Card tiers (v3-spec.md §9) — these are config, not scraped data
@@ -354,6 +356,170 @@ function handle_rank(req::HTTP.Request)::HTTP.Response
 end
 
 # ---------------------------------------------------------------------------
+# Basket job state — in-memory, lost on restart (acceptable for personal tool)
+# ---------------------------------------------------------------------------
+
+const BASKET_JOBS = Dict{String, Any}()
+
+function assignment_to_dict(a::ItemAssignment)::Dict{String, Any}
+    return Dict{String, Any}(
+        "item_name" => a.item_name,
+        "retailer_name" => a.retailer_name,
+        "path" => a.path,
+        "miles" => a.miles,
+        "spend" => a.spend,
+    )
+end
+
+function greedy_to_dict(g::GreedyResult)::Dict{String, Any}
+    return Dict{String, Any}(
+        "assignments" => [assignment_to_dict(a) for a in g.assignments],
+        "total_miles" => g.total_miles,
+        "total_spend" => g.total_spend,
+        "feasible" => g.feasible,
+    )
+end
+
+function milp_to_dict(m::MILPResult)::Dict{String, Any}
+    return Dict{String, Any}(
+        "assignments" => [assignment_to_dict(a) for a in m.assignments],
+        "total_miles" => m.total_miles,
+        "total_spend" => m.total_spend,
+        "feasible" => m.feasible,
+        "optimality_gap" => m.optimality_gap,
+        "termination_status" => m.termination_status,
+        "solve_time_seconds" => m.solve_time_seconds,
+    )
+end
+
+# ---------------------------------------------------------------------------
+# /basket handler — Phase 8: two-phase async response
+# ---------------------------------------------------------------------------
+
+function handle_basket(req::HTTP.Request)::HTTP.Response
+    body = String(req.body)
+
+    local data
+    try
+        data = JSON3.read(body)
+    catch e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "invalid JSON: $(e)")))
+    end
+
+    items_raw = get(data, :items, nothing)
+    category = String(get(data, :category, ""))
+    card_tier_key = String(get(data, :card_tier, "none"))
+    budget = Float64(get(data, :budget, 0.0))
+    tax_rate = Float64(get(data, :tax_rate, 0.0))
+
+    if items_raw === nothing || length(items_raw) == 0
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "missing or empty items array")))
+    end
+    if budget <= 0.0
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "budget must be positive")))
+    end
+
+    # Parse items
+    items = [(name=String(get(it, :name, "Item")), p_list=Float64(get(it, :p_list, 0.0))) for it in items_raw]
+
+    # Card tier
+    card_key = lowercase(card_tier_key)
+    card_key = get(CARD_TIER_ALIASES, card_key, card_key)
+    if !haskey(CARD_TIERS, card_key)
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "unknown card_tier: $(card_tier_key)")))
+    end
+    card = CARD_TIERS[card_key]
+
+    # Load retailers from DB
+    db = get_db()
+    snapshot = load_latest_snapshot(db)
+    if snapshot === nothing
+        return HTTP.Response(503, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "no_complete_snapshot")))
+    end
+    retailers = load_all_retailers(db, snapshot.snapshot_id, category)
+
+    # Phase 1: greedy solution (synchronous, fast)
+    greedy = greedy_basket(items, retailers, category, card, budget)
+
+    # Generate job ID
+    job_id = string(uuid4())
+    started_at = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
+
+    BASKET_JOBS[job_id] = Dict{String, Any}(
+        "status" => "running",
+        "greedy_result" => greedy,
+        "milp_result" => nothing,
+        "started_at" => started_at,
+        "completed_at" => nothing,
+        "error" => nothing,
+    )
+
+    # Phase 2: MILP solution (asynchronous)
+    @async begin
+        try
+            milp_result = milp_basket(items, retailers, category, card, budget; time_limit=28.0)
+            BASKET_JOBS[job_id]["status"] = "complete"
+            BASKET_JOBS[job_id]["milp_result"] = milp_result
+            BASKET_JOBS[job_id]["completed_at"] = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
+        catch e
+            BASKET_JOBS[job_id]["status"] = "failed"
+            BASKET_JOBS[job_id]["error"] = string(e)
+            BASKET_JOBS[job_id]["completed_at"] = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
+        end
+    end
+
+    # Return Phase 1 response immediately
+    response = Dict{String, Any}(
+        "job_id" => job_id,
+        "status" => "running",
+        "greedy" => greedy_to_dict(greedy),
+        "milp" => nothing,
+        "snapshot_id" => snapshot.snapshot_id,
+        "snapshot_completed_at" => snapshot.completed_at,
+    )
+
+    return HTTP.Response(200, ["Content-Type" => "application/json"],
+                         JSON3.write(response))
+end
+
+# ---------------------------------------------------------------------------
+# /basket/status/:job_id handler
+# ---------------------------------------------------------------------------
+
+function handle_basket_status(req::HTTP.Request, job_id::String)::HTTP.Response
+    if !haskey(BASKET_JOBS, job_id)
+        return HTTP.Response(404, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "job not found", "job_id" => job_id)))
+    end
+
+    job = BASKET_JOBS[job_id]
+    greedy_dict = greedy_to_dict(job["greedy_result"])
+
+    milp_dict = nothing
+    if job["milp_result"] !== nothing
+        milp_dict = milp_to_dict(job["milp_result"])
+    end
+
+    response = Dict{String, Any}(
+        "job_id" => job_id,
+        "status" => job["status"],
+        "greedy" => greedy_dict,
+        "milp" => milp_dict,
+        "started_at" => job["started_at"],
+        "completed_at" => job["completed_at"],
+        "error" => job["error"],
+    )
+
+    return HTTP.Response(200, ["Content-Type" => "application/json"],
+                         JSON3.write(response))
+end
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 
@@ -364,6 +530,11 @@ function router(req::HTTP.Request)::HTTP.Response
         return handle_score(req)
     elseif req.method == "POST" && req.target == "/rank"
         return handle_rank(req)
+    elseif req.method == "POST" && req.target == "/basket"
+        return handle_basket(req)
+    elseif req.method == "GET" && startswith(req.target, "/basket/status/")
+        job_id = replace(req.target, "/basket/status/" => "")
+        return handle_basket_status(req, job_id)
     else
         return HTTP.Response(404, ["Content-Type" => "application/json"],
                              JSON3.write(Dict("error" => "not found")))
