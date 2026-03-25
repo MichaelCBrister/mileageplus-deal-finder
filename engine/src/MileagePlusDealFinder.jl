@@ -19,5 +19,6 @@ export load_process_constraints, snapshot_age_hours
 export SnapshotInfo, RetailerData, ProcessConstraint
 export ItemAssignment, GreedyResult, MILPResult, CandidateOrder, OrderBonusTier
 export greedy_basket, milp_basket, build_candidate_orders, item_miles, per_item_miles_no_bonus
+export SweepSegment, breakpoint_sweep
 
 end # module MileagePlusDealFinder

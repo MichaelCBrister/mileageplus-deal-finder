@@ -125,11 +125,36 @@ app.post('/api/rank', async (req, res) => {
 
     const data = await resp.json();
 
-    // Inject log_template on each rank result for the frontend "Log" button (Phase 7)
+    // Inject process_constraints and log_template on each rank result (Phase 7/9)
     if (resp.ok && data.results && Array.isArray(data.results)) {
+      // Load process constraints per retailer from DB
+      let constraintsByRetailer = {};
+      try {
+        const db = new Database(DB_PATH);
+        const rows = db.prepare(
+          `SELECT r.name, pc.constraint_type, pc.severity, pc.description, pc.source
+           FROM process_constraints pc
+           JOIN retailers r ON pc.retailer_id = r.retailer_id`
+        ).all();
+        db.close();
+        for (const row of rows) {
+          if (!constraintsByRetailer[row.name]) constraintsByRetailer[row.name] = [];
+          constraintsByRetailer[row.name].push({
+            constraint_type: row.constraint_type,
+            severity: row.severity,
+            description: row.description || '',
+            source: row.source || '',
+          });
+        }
+      } catch (dbErr) {
+        console.error('Could not load process constraints for rank:', dbErr.message);
+      }
+
       const taxDecimal = (body.tax_rate || 0) / 100;
       const pList = body.p_list;
       data.results = data.results.map((r) => {
+        // Attach process constraints for this retailer
+        r.process_constraints = constraintsByRetailer[r.retailer_name] || [];
         const pathType = r.path || 'direct';
         const pCard = pList * (1 + taxDecimal);
         const pCash = (pathType === 'mpx' || pathType === 'stacked') ? pList : pCard;
@@ -148,6 +173,42 @@ app.post('/api/rank', async (req, res) => {
       });
     }
 
+    res.status(resp.status).json(data);
+  } catch (err) {
+    const message = err.name === 'AbortError'
+      ? 'Julia engine request timed out (5s)'
+      : `Julia engine unreachable: ${err.message}`;
+    res.status(503).json({ error: 'engine_unavailable', message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/sweep — Breakpoint sweep sensitivity analysis (Phase 9)
+// ---------------------------------------------------------------------------
+
+app.post('/api/sweep', async (req, res) => {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000); // 5s per v3-spec
+
+    const body = req.body;
+    const juliaBody = {
+      category: body.category || '',
+      card_tier: mapCardTier(body.card_tier),
+      p_min: body.p_min != null ? body.p_min : 0.0,
+      p_max: body.p_max != null ? body.p_max : 1000.0,
+      tax_rate: (body.tax_rate || 0) / 100, // frontend sends percentage, Julia expects decimal
+    };
+
+    const resp = await fetch(`${JULIA_ENGINE_URL}/sweep`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(juliaBody),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    const data = await resp.json();
     res.status(resp.status).json(data);
   } catch (err) {
     const message = err.name === 'AbortError'

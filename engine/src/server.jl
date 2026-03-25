@@ -520,6 +520,77 @@ function handle_basket_status(req::HTTP.Request, job_id::String)::HTTP.Response
 end
 
 # ---------------------------------------------------------------------------
+# /sweep handler — Phase 9: breakpoint sweep sensitivity analysis
+# ---------------------------------------------------------------------------
+
+function handle_sweep(req::HTTP.Request)::HTTP.Response
+    body = String(req.body)
+
+    local data
+    try
+        data = JSON3.read(body)
+    catch e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "invalid JSON: $(e)")))
+    end
+
+    category = String(get(data, :category, ""))
+    card_tier_key = String(get(data, :card_tier, "none"))
+    p_min = Float64(get(data, :p_min, 0.0))
+    p_max = Float64(get(data, :p_max, 1000.0))
+    tax_rate = Float64(get(data, :tax_rate, 0.0))
+
+    db = get_db()
+
+    # Load latest complete snapshot
+    snapshot = load_latest_snapshot(db)
+    if snapshot === nothing
+        return HTTP.Response(503, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict(
+                                "error" => "no_complete_snapshot",
+                                "message" => "No complete scrape snapshot available."
+                             )))
+    end
+
+    # Load all retailers
+    retailers = load_all_retailers(db, snapshot.snapshot_id, category)
+
+    # Card tier
+    card_key = lowercase(card_tier_key)
+    card_key = get(CARD_TIER_ALIASES, card_key, card_key)
+    if !haskey(CARD_TIERS, card_key)
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "unknown card_tier: $(card_tier_key)")))
+    end
+    card = CARD_TIERS[card_key]
+
+    # Run breakpoint sweep
+    segments = breakpoint_sweep(retailers, category, card; p_min=p_min, p_max=p_max, tax_rate=tax_rate)
+
+    # Serialize segments
+    segments_arr = [
+        Dict{String, Any}(
+            "spend_from" => s.spend_from,
+            "spend_to" => s.spend_to,
+            "retailer_name" => s.retailer_name,
+            "path" => s.path,
+            "miles_at_midpoint" => s.miles_at_midpoint,
+            "risk_class" => s.risk_class,
+        )
+        for s in segments
+    ]
+
+    return HTTP.Response(200, ["Content-Type" => "application/json"],
+                         JSON3.write(Dict{String, Any}(
+                            "segments" => segments_arr,
+                            "breakpoint_count" => length(segments) + 1,
+                            "retailer_count" => length(retailers),
+                            "snapshot_id" => snapshot.snapshot_id,
+                            "snapshot_completed_at" => snapshot.completed_at,
+                         )))
+end
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 
@@ -530,6 +601,8 @@ function router(req::HTTP.Request)::HTTP.Response
         return handle_score(req)
     elseif req.method == "POST" && req.target == "/rank"
         return handle_rank(req)
+    elseif req.method == "POST" && req.target == "/sweep"
+        return handle_sweep(req)
     elseif req.method == "POST" && req.target == "/basket"
         return handle_basket(req)
     elseif req.method == "GET" && startswith(req.target, "/basket/status/")

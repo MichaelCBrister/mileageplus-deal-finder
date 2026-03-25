@@ -21,7 +21,12 @@ done
 # 1. Julia engine (port 5000)
 echo "Starting Julia engine..."
 cd "$ROOT/engine"
-JULIA_PKG_SERVER="" /opt/miniconda3/bin/julia --project=. src/server.jl > "$LOGS/julia.log" 2>&1 &
+# Use /usr/local/bin/julia if available, fall back to conda
+JULIA_BIN="/usr/local/bin/julia"
+if [ ! -f "$JULIA_BIN" ]; then
+  JULIA_BIN="/opt/miniconda3/bin/julia"
+fi
+JULIA_PKG_SERVER="" "$JULIA_BIN" --project=. src/server.jl > "$LOGS/julia.log" 2>&1 &
 JULIA_PID=$!
 echo "  Julia PID: $JULIA_PID"
 
@@ -61,10 +66,15 @@ echo "$BRIDGE_PID" >> "$LOGS/pids.txt"
 echo "$FRONTEND_PID" >> "$LOGS/pids.txt"
 
 echo ""
-echo "All processes started."
-echo "  Julia engine: http://localhost:5000 (PID $JULIA_PID)"
-echo "  Node bridge:  http://localhost:4000 (PID $BRIDGE_PID)"
-echo "  React UI:     http://localhost:3000 (PID $FRONTEND_PID)"
+echo "=============================================="
+echo "  Dev stack running."
+echo "  Julia:    http://localhost:5000"
+echo "  Bridge:   http://localhost:4000"
+echo "  Frontend: http://localhost:3000"
+echo ""
+echo "  Note: seed snapshot is from 2026-03-24 and"
+echo "  will show as stale. Run the scraper to refresh."
+echo "=============================================="
 echo ""
 echo "PIDs saved to $LOGS/pids.txt"
 echo "Logs in $LOGS/{julia,bridge,frontend}.log"
