@@ -1,6 +1,6 @@
 # server.jl — HTTP.jl server on port 5000
-# Endpoints: /health, /score
-# Phase 3: reads from SQLite database instead of hardcoded fixtures.
+# Endpoints: /health, /score, /rank
+# Phase 4: adds MPX/Stacked scoring and rank_all endpoint.
 # Per v3-spec.md §4.1
 
 using HTTP
@@ -80,6 +80,7 @@ function parse_score_request(body::String)
     end
     card_tier_key = get(data, :card_tier, "explorer")
     tax_rate      = get(data, :tax_rate, 0.08)
+    path_str      = get(data, :path, "direct")
 
     if retailer_name === nothing
         return nothing, "missing field: retailer"
@@ -100,6 +101,7 @@ function parse_score_request(body::String)
         price         = price_f,
         card_tier_key = String(card_tier_key),
         tax_rate      = tax_rate_f,
+        path          = String(path_str),
     ), nothing
 end
 
@@ -118,14 +120,16 @@ function score_result_to_dict(result::ScoreResult;
         for c in process_constraints
     ]
 
-    return Dict{String, Any}(
+    d = Dict{String, Any}(
         "path"         => string(result.path),
         "portal_miles" => result.portal_miles,
         "card_miles"   => result.card_miles,
         "bonus_miles"  => result.bonus_miles,
+        "mpx_miles"    => result.mpx_miles,
         "total_miles"  => result.total_miles,
         "mpd"          => result.mpd,
         "risk_class"   => string(result.risk_class),
+        "retailer_name" => result.retailer_name,
         "spend" => Dict{String, Any}(
             "p_list"     => result.spend.p_list,
             "p_portal"   => result.spend.p_portal,
@@ -137,6 +141,13 @@ function score_result_to_dict(result::ScoreResult;
         "snapshot_completed_at" => snapshot_completed_at,
         "process_constraints"   => constraints_arr,
     )
+    if !isempty(result.gc_source)
+        d["gc_source"] = result.gc_source
+    end
+    if !isempty(result.destination)
+        d["destination"] = result.destination
+    end
+    return d
 end
 
 # ---------------------------------------------------------------------------
@@ -210,9 +221,17 @@ function handle_score(req::HTTP.Request)::HTTP.Response
         params.category
     )
 
-    # Score
-    result = score_direct(effective_retailer, spend, card, retailer_data.bonuses;
-                          product_query = params.category)
+    # Score based on requested path
+    local result::ScoreResult
+    if params.path == "mpx"
+        result = score_mpx(retailer_data, spend, card)
+    elseif params.path == "stacked"
+        # Stacked via /score uses same retailer as both GC source and destination
+        result = score_stacked(retailer_data, retailer_data, params.category, spend, card)
+    else
+        result = score_direct(effective_retailer, spend, card, retailer_data.bonuses;
+                              product_query = params.category)
+    end
 
     # Load process constraints
     constraints = load_process_constraints(db, params.retailer_name)
@@ -232,6 +251,109 @@ function handle_score(req::HTTP.Request)::HTTP.Response
 end
 
 # ---------------------------------------------------------------------------
+# /rank handler — Phase 4
+# ---------------------------------------------------------------------------
+
+function handle_rank(req::HTTP.Request)::HTTP.Response
+    body = String(req.body)
+
+    local data
+    try
+        data = JSON3.read(body)
+    catch e
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "invalid JSON: $(e)")))
+    end
+
+    p_list = get(data, :p_list, nothing)
+    tax_rate = get(data, :tax_rate, 0.08)
+    category = get(data, :category, "")
+    card_tier_key = get(data, :card_tier, "none")
+    risk_filter_raw = get(data, :risk_filter, nothing)
+
+    if p_list === nothing
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "missing field: p_list")))
+    end
+
+    db = get_db()
+
+    # Load latest complete snapshot
+    snapshot = load_latest_snapshot(db)
+    if snapshot === nothing
+        return HTTP.Response(503, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict(
+                                "error" => "no_complete_snapshot",
+                                "message" => "No complete scrape snapshot available."
+                             )))
+    end
+
+    # Load all retailers
+    category_str = String(category)
+    retailers = load_all_retailers(db, snapshot.snapshot_id, category_str)
+
+    # Build SpendVector
+    spend = SpendVector(Float64(p_list); tax_rate = Float64(tax_rate))
+
+    # Card tier
+    card_key = lowercase(String(card_tier_key))
+    card_key = get(CARD_TIER_ALIASES, card_key, card_key)
+    if !haskey(CARD_TIERS, card_key)
+        return HTTP.Response(400, ["Content-Type" => "application/json"],
+                             JSON3.write(Dict("error" => "unknown card_tier: $(card_tier_key)")))
+    end
+    card = CARD_TIERS[card_key]
+
+    # Parse risk filter
+    local rf::Union{Nothing, Set{RiskClass}}
+    if risk_filter_raw !== nothing
+        rf = Set{RiskClass}()
+        for s in risk_filter_raw
+            s_lower = lowercase(String(s))
+            if s_lower == "confirmed"
+                push!(rf, confirmed)
+            elseif s_lower == "uncertain"
+                push!(rf, uncertain)
+            elseif s_lower == "excluded"
+                push!(rf, excluded)
+            end
+        end
+    else
+        rf = nothing
+    end
+
+    # Rank all paths
+    results = rank_all(retailers, category_str, spend, card; risk_filter = rf)
+
+    # Serialize results
+    results_arr = [
+        Dict{String, Any}(
+            "path"          => string(r.path),
+            "retailer_name" => r.retailer_name,
+            "portal_miles"  => r.portal_miles,
+            "card_miles"    => r.card_miles,
+            "bonus_miles"   => r.bonus_miles,
+            "mpx_miles"     => r.mpx_miles,
+            "total_miles"   => r.total_miles,
+            "mpd"           => r.mpd,
+            "risk_class"    => string(r.risk_class),
+            "gc_source"     => r.gc_source,
+            "destination"   => r.destination,
+        )
+        for r in results
+    ]
+
+    return HTTP.Response(200, ["Content-Type" => "application/json"],
+                         JSON3.write(Dict{String, Any}(
+                            "results"              => results_arr,
+                            "snapshot_id"          => snapshot.snapshot_id,
+                            "snapshot_completed_at" => snapshot.completed_at,
+                            "retailer_count"       => length(retailers),
+                            "result_count"         => length(results),
+                         )))
+end
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 
@@ -240,6 +362,8 @@ function router(req::HTTP.Request)::HTTP.Response
         return handle_health(req)
     elseif req.method == "POST" && req.target == "/score"
         return handle_score(req)
+    elseif req.method == "POST" && req.target == "/rank"
+        return handle_rank(req)
     else
         return HTTP.Response(404, ["Content-Type" => "application/json"],
                              JSON3.write(Dict("error" => "not found")))

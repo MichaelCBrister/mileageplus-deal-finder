@@ -1,0 +1,250 @@
+PHASE 4 SESSION SUMMARY
+MileagePlus Deal Finder — MPX + Stacked Paths + rank_all + Multi-Path Ranking UI
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Add the MPX and Stacked earning paths to the Julia engine, implement rank_all
+to score all paths across all retailers in a single call, wire the /rank
+endpoint in both Julia and the Node bridge, and update the React frontend to
+show a ranked multi-path comparison table. The existing /score endpoint and
+single-item scoring UI from prior phases continue to work unchanged.
+
+
+ENVIRONMENT SETUP
+-----------------
+1. Julia binary: /opt/miniconda3/bin/julia (Julia 1.12.1, installed via conda)
+   Always run with: JULIA_PKG_SERVER=""
+2. Accepted conda TOS for repo.anaconda.com channels (fresh environment)
+3. Installed Julia via: conda install -c conda-forge julia
+4. Added Dates stdlib to Project.toml (was missing as a dependency)
+5. Database initialized with: bash db/init.sh
+6. Bridge dependencies installed: cd bridge && npm install
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+engine/src/types.jl  [MODIFIED]
+  Added mpx_miles, retailer_name, gc_source, destination fields to ScoreResult.
+  Added convenience constructor with keyword defaults for display fields so
+  existing score_direct calls continue to work with positional args.
+
+engine/src/scoring.jl  [MODIFIED — MAJOR ADDITIONS]
+  Added:
+    - worst_risk(a, b) — returns more severe of two risk classes
+    - risk_priority(rc) — numeric ordering for sort tiebreaking
+    - classify_category_from_tc(category, inclusions, exclusions, confidence) —
+      pure function for risk classification without DB dependency
+    - score_mpx(retailer_data, spend, card) — MPX gift card path scoring
+    - score_stacked(gc_retailer_data, dest_retailer_data, category, spend, card) —
+      two-leg stacked path scoring
+    - rank_all(retailers, category, spend, card; risk_filter) — scores all paths
+      across all retailers, sorted by total_miles descending
+  Updated:
+    - score_direct now includes mpx_miles=0.0 and retailer_name in ScoreResult
+
+engine/src/database.jl  [MODIFIED]
+  Added load_all_retailers(db, snapshot_id, category) function that loads all
+  retailers from a snapshot by joining retailer_rates and retailers tables.
+
+engine/src/server.jl  [MODIFIED]
+  Added:
+    - handle_rank() — /rank endpoint that loads all retailers, calls rank_all,
+      returns sorted results with snapshot metadata
+    - /rank route in router
+    - path parameter parsing in parse_score_request
+    - handle_score now dispatches on path: "direct" (default), "mpx", "stacked"
+  Updated:
+    - score_result_to_dict includes mpx_miles, retailer_name, gc_source,
+      destination fields
+
+engine/src/MileagePlusDealFinder.jl  [MODIFIED]
+  Added exports: score_mpx, score_stacked, rank_all, worst_risk,
+  classify_category_from_tc, load_all_retailers
+
+engine/test/runtests.jl  [MODIFIED]
+  Added include of database.jl (needed for RetailerData struct in tests)
+  Added include of test_phase4.jl
+
+engine/test/test_phase4.jl  [NEW]
+  Phase 4 unit tests:
+    - worst_risk: 7 tests covering all risk class combinations
+    - score_mpx: 4 test sets (basic no-card, with explorer card, zero rate, nothing rate)
+    - score_stacked: 4 test sets (gamma_r=false, gamma_r=true confirmed, excluded, no Leg 2 card miles)
+    - rank_all: 2 test sets (ordering with 3 retailers, risk filter)
+    - classify_category_from_tc: 4 tests
+
+bridge/server.js  [MODIFIED]
+  Replaced /api/rank 501 stub with real forwarding to Julia engine /rank endpoint.
+  5-second timeout. Converts tax_rate from percentage to decimal. Maps card_tier
+  aliases. Passes risk_filter if present.
+
+frontend/src/App.jsx  [MODIFIED — MAJOR REWRITE]
+  Added tab-based navigation (Score / Rank). Score panel preserves all Phase 2/3
+  functionality. New Rank panel includes:
+    - Form: p_list, tax_rate, category, card_tier, risk filter checkboxes
+    - Results table: Retailer, Path, Total Miles, Portal, Card, Bonus, MPX,
+      Risk Class (color-coded), Notes (gc_source -> destination for stacked)
+    - "Rates as of" timestamp with staleness warning
+    - Result count and retailer count summary
+
+docs/phase4-session-summary.txt  [NEW]
+  This file.
+
+engine/Project.toml  [MODIFIED]
+  Added Dates stdlib as explicit dependency.
+
+
+TEST RESULTS
+------------
+Command: cd engine && JULIA_PKG_SERVER="" /opt/miniconda3/bin/julia --project test/runtests.jl
+
+Result: 140 passed, 0 failed, 0 errored
+
+Breakdown:
+  - Phase 1-3 tests (test_bonus.jl, test_scoring.jl): 76 passed (unchanged)
+  - Phase 4 tests (test_phase4.jl): 64 passed
+    - worst_risk: 7
+    - score_mpx basic no card: 7
+    - score_mpx with explorer: 2
+    - score_mpx zero rate: 2
+    - score_mpx nothing rate: 1
+    - score_stacked gamma_r=false: 5
+    - score_stacked gamma_r=true confirmed: 9
+    - score_stacked gamma_r=true excluded: 3
+    - score_stacked no Leg 2 card miles: 1
+    - rank_all ordering: 7
+    - rank_all risk filter: 2
+    - classify_category_from_tc: 4
+    - Other implicit assertions within test sets: ~14
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Julia engine started: /opt/miniconda3/bin/julia --project src/server.jl (port 5000)
+Node bridge started: node server.js (port 4000)
+Database: db/mileageplus.db (initialized via bash db/init.sh)
+
+Test 1 — MPX score via Julia directly:
+  curl -s -X POST http://localhost:5000/score -H "Content-Type: application/json" \
+    -d '{"retailer":"Nike","p_list":100.0,"tax_rate":0.0,"category":"Footwear","card_tier":"none","path":"mpx"}'
+  -> path: "mpx"
+     mpx_miles: 300.0 (3.0 * 100)
+     card_miles: 0.0
+     bonus_miles: 75.0 (25% of 300)
+     total_miles: 375.0
+     risk_class: "confirmed"
+  PASS
+
+Test 2 — Direct score regression:
+  curl -s -X POST http://localhost:5000/score -H "Content-Type: application/json" \
+    -d '{"retailer":"BestBuy","p_list":200.0,"tax_rate":0.08,"category":"Electronics","card_tier":"none","path":"direct"}'
+  -> portal_miles: 400.0
+     card_miles: 0.0
+     bonus_miles: 500.0
+     total_miles: 900.0
+     risk_class: "confirmed"
+  PASS (identical to Phase 3 result)
+
+Test 3 — Rank all paths through Julia directly:
+  curl -s -X POST http://localhost:5000/rank -H "Content-Type: application/json" \
+    -d '{"p_list":100.0,"tax_rate":0.0,"category":"Electronics","card_tier":"none"}'
+  -> result_count: 9 (3 direct + 3 mpx + 3 stacked)
+     Top result: BestBuy direct, total=700.0 (portal=200 + bonus=500)
+     Stacked Nike->Walmart: portal=150.0 (leg2_portal > 0), total=525.0
+     Stacked BestBuy->Walmart: portal=150.0, total=400.0
+     All results sorted descending by total_miles
+  PASS
+
+Test 4 — Rank through bridge with card tier:
+  curl -s -X POST http://localhost:4000/api/rank -H "Content-Type: application/json" \
+    -d '{"p_list":100.0,"tax_rate":8,"category":"Electronics","card_tier":"one_x"}'
+  -> result_count: 9
+     card_miles: 108.0 on all results (explorer rate 1.0 * p_cash 108)
+     snapshot_completed_at: "2026-03-24T10:05:00"
+     HTTP status: 200 (not 501)
+  PASS
+
+Test 5 — Risk filter:
+  curl -s -X POST http://localhost:5000/rank -H "Content-Type: application/json" \
+    -d '{"p_list":100.0,"tax_rate":0.0,"category":"Electronics","card_tier":"none","risk_filter":["confirmed"]}'
+  -> result_count: 4
+     All results have risk_class: "confirmed"
+     No uncertain or excluded results present
+  PASS
+
+Test 6 — Stacked path with gamma_r=1 (Walmart destination):
+  From Test 3 response: Nike->Walmart stacked result has leg2_portal=150.0 > 0
+  (Walmart has gc_portal_eligible=true, Electronics not in Walmart exclusions)
+  card_miles=0.0 on stacked results (no Leg 2 card miles — gift card payment)
+  PASS
+
+Test 7 — Bridge /api/rank was previously 501, now returns real data:
+  Test 4 returned HTTP 200 with full results array, confirming the 501 stub
+  has been replaced with a working implementation.
+  PASS
+
+
+GIT
+---
+Branch:  claude/mpx-stacked-rank-phase-4-iAPCq
+Commit:  (see git log after push)
+Message: "Phase 4: MPX + Stacked paths + rank_all + multi-path ranking UI"
+Tag:     v0.4.0 (local)
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 4 (reserved for later phases):
+  Claude API T&C parser       (Phase 5) — risk classification uses exact string matching
+  Playwright scraper           (Phase 6) — database uses seed data only
+  Purchase log write path      (Phase 7) — purchase_log table exists but not written to
+  Basket MILP optimizer        (Phase 8) — /basket endpoint does not exist
+  Sensitivity sweep            (Phase 9)
+
+NOT changed in Phase 4:
+  /score direct path behavior is identical to Phase 3
+  All 76 existing tests pass without modification
+  No new MPX rates or gc_portal_eligible overrides added to seed data
+  No module restructuring — only added load_all_retailers export
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /opt/miniconda3/bin/julia (Julia 1.12.1, installed via conda)
+   Always run with: JULIA_PKG_SERVER=""
+
+2. Database initialization: bash db/init.sh
+   Must be run before starting the Julia engine.
+
+3. The /score endpoint now supports a "path" parameter: "direct" (default),
+   "mpx", or "stacked". Existing callers that don't send path get direct.
+
+4. classify_category_from_tc in scoring.jl differs slightly from
+   classify_category in database.jl: when a category is not in inclusions
+   but also not in exclusions, scoring.jl returns :uncertain (portal miles
+   included with warning) while database.jl returns :excluded. This was
+   intentional for Phase 4: the task requires Electronics at Walmart to
+   have leg2_portal > 0 in stacked path. The /score direct path still uses
+   classify_category from database.jl (unchanged Phase 3 behavior). Phase 5
+   should reconcile these two functions when the AI T&C parser is added.
+
+5. ScoreResult now has mpx_miles, retailer_name, gc_source, and destination
+   fields. All existing code passes default values ("", 0.0) for these.
+
+6. The stacked path risk logic: when Leg 2 has excluded risk (category not
+   eligible at destination), the stacked path degrades to MPX-only and the
+   combined risk is :confirmed (no risky miles in the total). This is per
+   the task specification.
+
+7. rank_all generates up to N_direct + N_mpx + N_mpx * N_gc_eligible results.
+   With 3 seed retailers (1 gc_eligible), that's 3 + 3 + 3 = 9 results.
+   At 400 retailers this could be large. Phase 8 pagination may be needed.
+
+8. The bridge converts tax_rate from percentage to decimal for BOTH /api/score
+   and /api/rank. When calling Julia directly via curl, pass decimal (e.g., 0.08).
+
+9. The frontend max-width was increased from 600px to 900px to accommodate
+   the wider ranking table.

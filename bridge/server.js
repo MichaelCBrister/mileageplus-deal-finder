@@ -71,9 +71,39 @@ app.post('/api/score', async (req, res) => {
   }
 });
 
-// POST /api/rank — stub for Phase 4
-app.post('/api/rank', (_req, res) => {
-  res.status(501).json({ error: 'not_implemented', phase: 4 });
+// POST /api/rank — forward to Julia engine with 5s timeout (Phase 4)
+app.post('/api/rank', async (req, res) => {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const body = req.body;
+    const juliaBody = {
+      p_list: body.p_list,
+      tax_rate: (body.tax_rate || 0) / 100, // frontend sends percentage, Julia expects decimal
+      category: body.category || '',
+      card_tier: mapCardTier(body.card_tier),
+    };
+    if (body.risk_filter) {
+      juliaBody.risk_filter = body.risk_filter;
+    }
+
+    const resp = await fetch(`${JULIA_ENGINE_URL}/rank`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(juliaBody),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    const data = await resp.json();
+    res.status(resp.status).json(data);
+  } catch (err) {
+    const message = err.name === 'AbortError'
+      ? 'Julia engine request timed out (5s)'
+      : `Julia engine unreachable: ${err.message}`;
+    res.status(503).json({ error: 'engine_unavailable', message });
+  }
 });
 
 // Map frontend card_tier values to Julia engine card_tier keys
