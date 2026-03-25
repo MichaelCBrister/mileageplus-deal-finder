@@ -2,9 +2,13 @@
 // Phase 2: forwards /api/score to Julia engine on port 5000
 
 const express = require('express');
+const path = require('path');
+const Database = require('better-sqlite3');
+const { parseTAndC, parseBonus } = require('./tc-parser');
 
 const JULIA_ENGINE_URL = process.env.JULIA_ENGINE_URL || 'http://localhost:5000';
 const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '4000', 10);
+const DB_PATH = path.resolve(__dirname, '..', 'db', 'mileageplus.db');
 
 const app = express();
 app.use(express.json());
@@ -103,6 +107,132 @@ app.post('/api/rank', async (req, res) => {
       ? 'Julia engine request timed out (5s)'
       : `Julia engine unreachable: ${err.message}`;
     res.status(503).json({ error: 'engine_unavailable', message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/parse-tc — Parse T&C text via Claude API, update database
+// ---------------------------------------------------------------------------
+
+app.post('/api/parse-tc', async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(400).json({
+      error: 'api_key_missing',
+      message: 'ANTHROPIC_API_KEY environment variable is not set. Set it before calling parse endpoints.',
+    });
+  }
+
+  const { retailer_name, raw_text, snapshot_id } = req.body;
+  if (!retailer_name || !raw_text || !snapshot_id) {
+    return res.status(400).json({ error: 'missing_fields', message: 'Required: retailer_name, raw_text, snapshot_id' });
+  }
+
+  try {
+    const parsed = await parseTAndC(raw_text, retailer_name);
+
+    // Update database
+    let dbUpdated = false;
+    try {
+      const db = new Database(DB_PATH);
+      // Find retailer_id
+      const retailer = db.prepare(
+        "SELECT retailer_id FROM retailers WHERE LOWER(REPLACE(name, ' ', '')) = LOWER(REPLACE(?, ' ', ''))"
+      ).get(retailer_name);
+
+      if (retailer) {
+        const stmt = db.prepare(
+          `UPDATE tc_rules SET inclusions = ?, exclusions = ?, confidence = ?, raw_text = ?
+           WHERE retailer_id = ? AND snapshot_id = ?`
+        );
+        const result = stmt.run(
+          parsed.inclusions.join(','),
+          parsed.exclusions.join(','),
+          parsed.confidence,
+          raw_text,
+          retailer.retailer_id,
+          snapshot_id
+        );
+        dbUpdated = result.changes > 0;
+
+        // If no row existed to update, insert one
+        if (!dbUpdated) {
+          const insertStmt = db.prepare(
+            `INSERT INTO tc_rules (retailer_id, snapshot_id, inclusions, exclusions, raw_text, confidence, parsed_at)
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
+          );
+          insertStmt.run(
+            retailer.retailer_id,
+            snapshot_id,
+            parsed.inclusions.join(','),
+            parsed.exclusions.join(','),
+            raw_text,
+            parsed.confidence
+          );
+          dbUpdated = true;
+        }
+      }
+      db.close();
+    } catch (dbErr) {
+      console.error('Database error in /api/parse-tc:', dbErr.message);
+    }
+
+    res.json({ ...parsed, db_updated: dbUpdated });
+  } catch (err) {
+    res.status(500).json({ error: 'parse_failed', message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/parse-bonus — Parse bonus offer text via Claude API, update database
+// ---------------------------------------------------------------------------
+
+app.post('/api/parse-bonus', async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(400).json({
+      error: 'api_key_missing',
+      message: 'ANTHROPIC_API_KEY environment variable is not set. Set it before calling parse endpoints.',
+    });
+  }
+
+  const { retailer_name, raw_text, snapshot_id, base_rate, bonus_type_hint } = req.body;
+  if (!retailer_name || !raw_text || !snapshot_id) {
+    return res.status(400).json({ error: 'missing_fields', message: 'Required: retailer_name, raw_text, snapshot_id' });
+  }
+
+  try {
+    const parsed = await parseBonus(raw_text, retailer_name, base_rate || 1.0);
+
+    // Update database
+    let dbUpdated = false;
+    try {
+      const db = new Database(DB_PATH);
+      const retailer = db.prepare(
+        "SELECT retailer_id FROM retailers WHERE LOWER(REPLACE(name, ' ', '')) = LOWER(REPLACE(?, ' ', ''))"
+      ).get(retailer_name);
+
+      if (retailer) {
+        // Insert or replace bonus_offers row
+        const stmt = db.prepare(
+          `INSERT OR REPLACE INTO bonus_offers (retailer_id, snapshot_id, bonus_type, config_json, raw_text, parsed_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))`
+        );
+        stmt.run(
+          retailer.retailer_id,
+          snapshot_id,
+          parsed.bonus_type,
+          JSON.stringify(parsed.config),
+          raw_text
+        );
+        dbUpdated = true;
+      }
+      db.close();
+    } catch (dbErr) {
+      console.error('Database error in /api/parse-bonus:', dbErr.message);
+    }
+
+    res.json({ ...parsed, db_updated: dbUpdated });
+  } catch (err) {
+    res.status(500).json({ error: 'parse_failed', message: err.message });
   }
 });
 

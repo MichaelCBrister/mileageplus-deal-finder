@@ -249,6 +249,6 @@ end
 @testset "classify_category_from_tc" begin
     @test classify_category_from_tc("Electronics", "Electronics,Computers", "Gift Cards", 0.95) == confirmed
     @test classify_category_from_tc("Gift Cards", "Electronics,Computers", "Gift Cards", 0.95) == excluded
-    @test classify_category_from_tc("Toys", "Electronics,Computers", "Gift Cards", 0.95) == uncertain  # not in inclusions, not in exclusions → uncertain
+    @test classify_category_from_tc("Toys", "Electronics,Computers", "Gift Cards", 0.95) == excluded  # not in inclusions → excluded (Phase 5 reconciliation)
     @test classify_category_from_tc("Anything", "", "", 0.5) == uncertain  # low confidence
 end

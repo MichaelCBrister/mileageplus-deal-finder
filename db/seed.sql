@@ -34,7 +34,7 @@ VALUES
   (1, 'seed-snapshot-001', 'flat_tiered',
    '{"tiers":[[100.0,500.0]],"cumulative":true,"once_per_member":false,"new_customer_only":false,"min_order_value":100.0,"excluded_payment_types":[],"category_restrictions":null}',
    '2026-03-01', '2026-04-30',
-   'Earn 500 bonus miles on purchases of $100 or more at Best Buy.',
+   'Earn 500 bonus miles when you spend $100 or more at BestBuy.com. Offer valid on qualifying purchases only. Gift cards excluded.',
    '2026-03-24T10:00:00');
 
 -- Nike: per_order_flat bonus
@@ -43,20 +43,20 @@ VALUES
   (2, 'seed-snapshot-001', 'per_order_flat',
    '{"miles":250.0,"min_order_value":75.0,"once_per_member":false,"excluded_payment_types":[]}',
    '2026-03-01', '2026-04-30',
-   'Earn 250 bonus miles on orders of $75 or more at Nike.',
+   'Earn 250 bonus miles on qualifying orders of $75 or more at Nike.com.',
    '2026-03-24T10:00:00');
 
 -- T&C rules (snapshot-scoped)
 INSERT OR IGNORE INTO tc_rules (retailer_id, snapshot_id, inclusions, exclusions, raw_text, confidence, parsed_at)
 VALUES
   (1, 'seed-snapshot-001', 'Electronics,Computers,Appliances', 'Gift Cards,Services',
-   'Eligible categories: Electronics, Computers, Appliances. Excludes: Gift Cards, Services.',
+   'Earn miles on electronics, computers, tablets, and appliances purchased at BestBuy.com. Gift cards, services, warranties, and delivery fees are not eligible for mile earning. Miles are earned on the purchase price excluding taxes and shipping.',
    0.95, '2026-03-24T10:00:00'),
   (2, 'seed-snapshot-001', 'Clothing,Footwear,Accessories', 'Gift Cards',
-   'Eligible categories: Clothing, Footwear, Accessories. Excludes: Gift Cards.',
+   'Earn miles on clothing, footwear, and accessories at Nike.com. Gift cards and Nike gift certificates are excluded. Customized products (NIKEiD) are excluded. Taxes, shipping charges, and returns are not eligible.',
    0.98, '2026-03-24T10:00:00'),
   (3, 'seed-snapshot-001', 'General Merchandise,Grocery', 'Gift Cards,Pharmacy,Tobacco',
-   'Eligible categories: General Merchandise, Grocery. Excludes: Gift Cards, Pharmacy, Tobacco.',
+   'Earn miles on general merchandise and grocery purchases at Walmart.com. Gift cards, pharmacy purchases, tobacco, alcohol, and firearms are excluded. Purchases paid with Walmart gift cards are eligible for portal mile earning.',
    0.90, '2026-03-24T10:00:00');
 
 -- Process constraints (not snapshot-scoped)
