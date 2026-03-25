@@ -247,6 +247,68 @@ function mapCardTier(tier) {
   return map[tier] || tier || 'none';
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/scraper/status — Latest scrape snapshot status (Phase 6)
+// ---------------------------------------------------------------------------
+
+app.get('/api/scraper/status', (_req, res) => {
+  try {
+    const db = new Database(DB_PATH);
+    const snapshot = db.prepare(
+      `SELECT snapshot_id, status, started_at, completed_at, retailer_count, error_count
+       FROM scrape_snapshots ORDER BY started_at DESC LIMIT 1`
+    ).get();
+    db.close();
+
+    if (!snapshot) {
+      return res.json({ snapshot: null });
+    }
+
+    let ageHours = null;
+    if (snapshot.completed_at) {
+      ageHours = (Date.now() - new Date(snapshot.completed_at).getTime()) / (1000 * 3600);
+      ageHours = Math.round(ageHours * 10) / 10;
+    }
+
+    res.json({
+      snapshot_id: snapshot.snapshot_id,
+      status: snapshot.status,
+      started_at: snapshot.started_at,
+      completed_at: snapshot.completed_at,
+      retailer_count: snapshot.retailer_count,
+      error_count: snapshot.error_count,
+      age_hours: ageHours,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'db_error', message: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/scraper/run-check — Can a new scrape be run? (Phase 6)
+// ---------------------------------------------------------------------------
+
+app.get('/api/scraper/run-check', (_req, res) => {
+  try {
+    const db = new Database(DB_PATH);
+    const todayUTC = new Date().toISOString().slice(0, 10);
+    const row = db.prepare(
+      `SELECT COUNT(*) as cnt FROM scrape_snapshots
+       WHERE status IN ('complete', 'partial')
+       AND started_at >= ? AND started_at < ?`
+    ).get(todayUTC + 'T00:00:00', todayUTC + 'T99:99:99');
+    db.close();
+
+    if (row.cnt > 0) {
+      res.json({ can_scrape: false, reason: 'already_scraped_today' });
+    } else {
+      res.json({ can_scrape: true, reason: 'ready' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: 'db_error', message: err.message });
+  }
+});
+
 app.listen(BRIDGE_PORT, () => {
   console.log(`Bridge server listening on port ${BRIDGE_PORT}`);
   console.log(`Julia engine URL: ${JULIA_ENGINE_URL}`);
