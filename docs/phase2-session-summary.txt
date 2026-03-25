@@ -191,9 +191,10 @@ Test 5 — Rank stub:
 GIT
 ---
 Branch:  claude/node-bridge-react-phase-2
-Commit:  (pending)
+Commit:  62e544b
 Message: "Phase 2: Node bridge + React UI for single-item scoring"
 Tag:     v0.2.0 (local)
+PR:      https://github.com/MichaelCBrister/mileageplus-deal-finder/pull/2
 
 Note: Tag push to remote may return 403 (known limitation of
 Claude Code git proxy, same as Phase 1).
