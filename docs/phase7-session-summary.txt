@@ -1,0 +1,219 @@
+PHASE 7 SESSION SUMMARY
+MileagePlus Deal Finder — Purchase Log with Spend Vector and Posting Tracker
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Wire the purchase log so that after a user acts on a scoring recommendation,
+they can record the purchase and track whether miles post. Specifically:
+  - Add POST/GET/PATCH/DELETE endpoints for purchase_log in the Node bridge
+  - Add log_template field to /score and /rank responses in the bridge layer
+  - Add Purchases tab to React frontend with history table, summary stats,
+    manual log form, and mark-posted/delete actions
+  - Add "Log this purchase" button to Score tab and "Log" buttons to Rank rows
+  - No Julia engine changes — all purchase log logic lives in the Node bridge
+
+
+ENVIRONMENT SETUP
+-----------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+2. Database initialized with: rm -f db/mileageplus.db && bash db/init.sh
+3. Bridge dependencies already installed from Phase 6 (includes better-sqlite3)
+4. Frontend dependencies already installed from Phase 4
+5. purchase_log table already existed in db/schema.sql from Phase 3 with
+   correct columns and CHECK constraints matching v3-spec.md section 6
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+bridge/purchase-log.js  [NEW]
+  Database operations module for purchase log. Exports: insertPurchase,
+  listPurchases, markPosted, deletePurchase. Handles retailer name lookup,
+  spend vector defaults (fill p_portal/p_card/p_cash from p_list when not
+  provided), UTC timestamp formatting without milliseconds/Z suffix,
+  posting_status derivation (posted/pending/overdue based on 90-day window).
+
+bridge/server.js  [MODIFIED]
+  Added:
+    - Import of purchase-log.js helper functions
+    - log_template injection in /api/score response (after Julia response,
+      before sending to frontend)
+    - log_template injection on each result in /api/rank response
+    - POST /api/purchases — log a new purchase
+    - GET /api/purchases — list all purchases with posting status
+    - PATCH /api/purchases/:id/posted — mark miles as posted
+    - DELETE /api/purchases/:id — delete a purchase log entry
+  Unchanged: /api/score and /api/rank forwarding logic, tax_rate conversion,
+  /api/parse-tc, /api/parse-bonus, /api/scraper/status, /api/scraper/run-check
+
+frontend/src/App.jsx  [MODIFIED]
+  Added:
+    - Purchases tab in navigation (between Rank and Scraper)
+    - PurchasesPanel component with:
+      - Summary stats bar (total purchases, expected/posted/pending miles,
+        posting rate percentage)
+      - Purchase history table (date, retailer, path, expected/posted miles,
+        status with color-coded badges, mark-posted and delete actions)
+      - Manual log form (retailer, path, list price, expected miles, risk
+        class, snapshot ID, with Advanced toggle for spend vector fields)
+    - "Log this purchase" button in ScorePanel after score results
+    - "Log" button column in RankPanel results table with green highlight
+      on successful log
+    - useEffect import for PurchasesPanel data loading
+
+docs/phase7-session-summary.txt  [NEW]
+  This file.
+
+
+TEST RESULTS
+------------
+Command: cd engine && JULIA_PKG_SERVER="" /usr/local/bin/julia --project test/runtests.jl
+
+Result: 140 passed, 0 failed, 0 errored
+
+Breakdown:
+  - Phase 1-3 tests (test_bonus.jl, test_scoring.jl): 76 passed (unchanged)
+  - Phase 4 tests (test_phase4.jl): 64 passed (unchanged)
+  No new Julia tests added — Phase 7 is a bridge and frontend phase.
+  No Julia source files were modified.
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Julia engine started: /usr/local/bin/julia --project src/server.jl (port 5000)
+Node bridge started: node server.js (port 4000)
+Database: db/mileageplus.db (initialized via bash db/init.sh)
+
+Test 1 — Log a purchase via bridge:
+  curl -s -X POST http://localhost:4000/api/purchases -H "Content-Type: application/json" \
+    -d '{"retailer":"BestBuy","path_type":"direct","p_list":200.0,"p_portal":200.0,"p_card":216.0,"p_cash":216.0,"miles_expected":900,"risk_class":"confirmed","snapshot_id":"seed-snapshot-001"}'
+  -> 201 with:
+     purchase_id: 1
+     retailer_name: "BestBuy"
+     purchased_at: "2026-03-25T22:44:10"
+     miles_posted: null
+     posted_at: null
+  PASS
+
+Test 2 — List purchases:
+  curl -s http://localhost:4000/api/purchases
+  -> 200 with {"purchases":[...], "count":1}
+     posting_status: "pending" (recent purchase, miles_posted=null)
+  PASS
+
+Test 3 — Mark as posted:
+  curl -s -X PATCH http://localhost:4000/api/purchases/1/posted -H "Content-Type: application/json" \
+    -d '{"miles_posted":900}'
+  -> 200 with:
+     miles_posted: 900
+     posted_at: "2026-03-25T22:44:18"
+     posting_status: "posted"
+  PASS
+
+Test 4 — Score response includes log_template:
+  curl -s -X POST http://localhost:4000/api/score -H "Content-Type: application/json" \
+    -d '{"retailer":"Nike","p_list":120.0,"tax_rate":8,"category":"Footwear","card_tier":"one_x","path":"direct"}'
+  -> log_template present with:
+     retailer: "Nike"
+     path_type: "direct"
+     p_list: 120
+     miles_expected: 740 (round of 739.6 — tax_rate=8% gives p_card=129.6)
+     risk_class: "confirmed"
+     snapshot_id: "seed-snapshot-001"
+  PASS
+  Note: The task spec expected miles_expected=738 based on tax_rate=7 from
+  Phase 3 but the curl command specified tax_rate=8. With 8%, card_miles=129.6,
+  total=739.6, rounded to 740. Behavior is correct.
+
+Test 5 — Rank response includes log_template on each result:
+  curl -s -X POST http://localhost:4000/api/rank -H "Content-Type: application/json" \
+    -d '{"p_list":100.0,"tax_rate":0,"category":"Electronics","card_tier":"none"}'
+  -> All 9 results have log_template: True
+  PASS
+
+Test 6 — Delete a purchase:
+  curl -s -X DELETE http://localhost:4000/api/purchases/1
+  -> 200 with {"deleted":true,"purchase_id":1}
+  Follow up: GET /api/purchases -> count=0
+  PASS
+
+Test 7 — 404 for unknown retailer:
+  curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:4000/api/purchases \
+    -H "Content-Type: application/json" \
+    -d '{"retailer":"UnknownStore","path_type":"direct","p_list":100.0,"p_portal":100.0,"p_card":100.0,"p_cash":100.0,"miles_expected":200,"risk_class":"confirmed","snapshot_id":"seed-snapshot-001"}'
+  -> 404
+  PASS
+
+Test 8 — Spend vector defaults when only p_list provided:
+  curl -s -X POST http://localhost:4000/api/purchases -H "Content-Type: application/json" \
+    -d '{"retailer":"Nike","path_type":"direct","p_list":100.0,"miles_expected":550,"risk_class":"confirmed","snapshot_id":"seed-snapshot-001"}'
+  -> 201 with p_portal=100.0, p_card=100.0, p_cash=100.0
+  PASS
+
+
+GIT
+---
+Branch:  claude/purchase-log-phase-7
+Commit:  (see git log after push)
+Message: "Phase 7: Purchase log with spend vector and posting tracker"
+Tag:     v0.7.0 (local — tag push may return 403 due to Claude Code git proxy)
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 7 (reserved for later phases or out of scope):
+  No Julia engine changes (all purchase log logic in Node bridge)
+  No posting probability or ML-based posting prediction
+  No email or push notifications for overdue purchases
+  No basket optimizer or MILP (Phase 8)
+  No breakpoint sweep sensitivity analysis (Phase 9)
+  No automatic purchase logging on score/rank requests
+  No authentication or multi-user support
+
+NOT changed in Phase 7:
+  No Julia source files modified (types.jl, scoring.jl, database.jl, server.jl)
+  No Julia tests modified
+  SQLite schema unchanged (purchase_log table already existed from Phase 3)
+  Seed data unchanged
+  All 140 Julia tests pass without modification
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+
+2. Database initialization: rm -f db/mileageplus.db && bash db/init.sh
+   Must delete existing DB first for clean seed data.
+
+3. The bridge converts tax_rate from percentage to decimal for /api/score
+   and /api/rank. The log_template computation in the bridge also uses
+   this converted decimal tax_rate for p_card calculation.
+
+4. TIMESTAMP FORMAT: purchase-log.js formats timestamps as
+   "YYYY-MM-DDTHH:MM:SS" (no milliseconds, no Z suffix) to match the
+   Julia engine's dateformat parser. This is consistent with the scraper
+   timestamp format from Phase 6.
+
+5. POSTING STATUS: posting_status is derived at query time in listPurchases:
+   - "posted" if miles_posted is not null
+   - "overdue" if purchased_at > 90 days ago and miles_posted is null
+   - "pending" otherwise
+   The 90-day threshold comes from v3-spec.md section 3.4. Some retailers
+   may take up to 120 days. The threshold is documented in a code comment.
+
+6. SPEND VECTOR DEFAULTS: When POST /api/purchases receives only p_list
+   (without p_portal, p_card, p_cash), the bridge fills them all with
+   p_list value. This is the simple default for the manual log form.
+   The log_template from /score and /rank uses proper tax-adjusted values.
+
+7. The log_template is computed in the bridge layer, NOT in the Julia engine.
+   Julia does not know about the purchase log. This keeps the separation
+   clean: Julia scores, bridge manages purchase tracking.
+
+8. The "Log" button in the Rank table briefly highlights the row green for
+   2 seconds after a successful log. This is a CSS transition, not a
+   timer-based poll.
