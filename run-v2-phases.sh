@@ -98,7 +98,7 @@ kill_stale_processes() {
 phase_done() {
   local PHASE_NUM=$1
   cd "$ROOT"
-  git log --oneline 2>/dev/null | grep -qiE "phase ${PHASE_NUM}[^0-9]|phase ${PHASE_NUM}$" && return 0
+  git log --oneline 2>/dev/null | grep -qiE "^[a-f0-9]+ phase ${PHASE_NUM}:" && return 0
   return 1
 }
 
@@ -123,7 +123,7 @@ run_phase() {
 
   # Run Claude Code non-interactively with permission skip
   # Timeout after 30 minutes per phase to prevent infinite hangs
-  timeout 1800 claude --dangerously-skip-permissions -p "$PHASE_PROMPT" 2>&1 | tee "$LOG_FILE"
+  gtimeout 1800 claude --dangerously-skip-permissions -p "$PHASE_PROMPT" 2>&1 | tee "$LOG_FILE"
 
   local EXIT_CODE=${PIPESTATUS[0]}
 
