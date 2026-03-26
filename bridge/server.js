@@ -698,6 +698,17 @@ app.get('/api/basket/status/:job_id', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/config — Basic configuration status for the settings page (Phase 12)
+// ---------------------------------------------------------------------------
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    api_key_configured: !!process.env.ANTHROPIC_API_KEY,
+    freshness_hours: FRESHNESS_HOURS,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/search — Query interpretation + scoring + results (Phase 11)
 // ---------------------------------------------------------------------------
 
