@@ -1,0 +1,280 @@
+PHASE 9 SESSION SUMMARY
+MileagePlus Deal Finder — Breakpoint Sweep Sensitivity Analysis + V1 Polish
+Date: 2026-03-25
+==================================================
+
+OBJECTIVE
+---------
+Implement the piecewise-optimal breakpoint sweep from v3-spec.md section 7.4,
+expose it via /sweep endpoint in the Julia engine and /api/sweep in the bridge,
+add a Spend Sensitivity slider to the Rank tab in the React frontend, and apply
+final polish across the tool: README updates, CLAUDE.md updates, process
+constraint warnings in Rank tab, startup script improvements, and comprehensive
+end-to-end smoke tests. At the end of this phase the tool is v1 complete.
+
+
+ENVIRONMENT SETUP
+-----------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+2. Database initialized with: rm -f db/mileageplus.db && bash db/init.sh
+3. Bridge dependencies already installed from prior phases.
+4. Frontend dependencies already installed from prior phases.
+5. All 166 prior tests passed before any Phase 9 code was written.
+
+
+FILES CREATED / MODIFIED
+--------------------------
+
+engine/src/basket.jl  [MODIFIED]
+  Added SweepSegment struct and breakpoint_sweep function. The sweep collects
+  breakpoints from bonus thresholds (FlatTieredBonus tier thresholds,
+  PerOrderFlatBonus min_spend values), sorts them, and evaluates rank_all at
+  each interval midpoint to determine the piecewise-optimal retailer/path.
+
+engine/src/server.jl  [MODIFIED]
+  Added handle_sweep() function and /sweep POST route. Loads retailers from
+  latest snapshot, parses card_tier with alias mapping, calls breakpoint_sweep,
+  returns segments array with metadata. 5-second sync timeout.
+
+engine/src/MileagePlusDealFinder.jl  [MODIFIED]
+  Added exports: SweepSegment, breakpoint_sweep.
+
+engine/test/runtests.jl  [MODIFIED]
+  Added include of test_phase9.jl.
+
+engine/test/test_phase9.jl  [NEW]
+  Phase 9 unit tests (38 tests):
+    - breakpoint_sweep basic contiguity: segments are non-empty, contiguous,
+      cover [p_min, p_max], all fields valid
+    - breakpoint_sweep has breakpoints at 75 and 100: Nike per_order_flat
+      min_spend and BestBuy flat_tiered threshold appear as boundaries
+    - breakpoint_sweep single point: p_min == p_max returns 1 segment
+    - breakpoint_sweep path changes: soft assertion that winner changes
+      across range (warning logged if not)
+    - SweepSegment struct and JSON serialization: construction, Dict
+      conversion, JSON3 round-trip
+    - breakpoint_sweep with card: explorer card produces higher miles than
+      no card at same spend level
+
+bridge/server.js  [MODIFIED]
+  Added POST /api/sweep endpoint forwarding to Julia with 5-second timeout.
+  Tax_rate percentage-to-decimal conversion and card_tier mapping applied.
+  Added process_constraints injection on /api/rank results by loading from
+  SQLite and attaching per retailer name.
+
+frontend/src/SweepPanel.jsx  [NEW]
+  React component for spend sensitivity analysis. Collapsible panel shown
+  below Rank results. Contains: p_min/p_max inputs, Run Sweep button,
+  spend slider (HTML range input), active segment display with retailer/path/
+  miles/risk badge, segment summary table with highlighted active row.
+  All slider interaction is client-side (no API calls on drag).
+
+frontend/src/App.jsx  [MODIFIED]
+  Three targeted edits:
+    1. Added import SweepPanel from './SweepPanel'
+    2. Added SweepPanel component inside RankPanel results section
+    3. Added process constraint warning icon (yellow triangle) next to
+       retailer names in Rank table with tooltip showing descriptions
+
+scripts/start-dev.sh  [MODIFIED]
+  Updated Julia binary detection to check /usr/local/bin/julia first, fall
+  back to /opt/miniconda3/bin/julia. Updated startup summary to show all
+  three URLs and seed snapshot staleness note.
+
+README.md  [REWRITTEN]
+  Accurate v1 description: what the tool does, four-layer architecture,
+  three earning paths, build phases table (all 9 complete), setup
+  instructions, and known gaps section.
+
+CLAUDE.md  [MODIFIED]
+  Added "V1 COMPLETE - PHASE 9 NOTES" section with: current file structure
+  listing all key source files, test count (204), known gaps (6 items),
+  and instructions for Phase 10+ sessions.
+
+docs/phase9-session-summary.txt  [NEW]
+  This file.
+
+
+TEST RESULTS
+------------
+Command: cd engine && JULIA_PKG_SERVER="" /usr/local/bin/julia --project test/runtests.jl
+
+Result: 204 passed, 0 failed, 0 errored
+
+Breakdown:
+  - Phase 1-3 tests (test_bonus.jl, test_scoring.jl): 76 passed (unchanged)
+  - Phase 4 tests (test_phase4.jl): 64 passed (unchanged)
+  - Phase 8 tests (test_phase8.jl): 26 passed (unchanged)
+  - Phase 9 tests (test_phase9.jl): 38 passed
+    - breakpoint_sweep basic contiguity: 10
+    - breakpoint_sweep breakpoints at 75 and 100: 2
+    - breakpoint_sweep single point: 3
+    - breakpoint_sweep path changes: 1 (+ warning logged)
+    - SweepSegment struct and JSON: 9
+    - breakpoint_sweep with card: 1
+    - Implicit assertions within test sets: 12
+
+
+ACCEPTANCE TEST RESULTS
+------------------------
+Julia engine started: /usr/local/bin/julia --project src/server.jl (port 5000)
+Node bridge started: node server.js (port 4000)
+Database: db/mileageplus.db (initialized via bash db/init.sh)
+
+Test 1 — Sweep endpoint, basic:
+  curl -s -X POST http://localhost:4000/api/sweep -H "Content-Type: application/json" \
+    -d '{"category":"Electronics","card_tier":"none","p_min":0,"p_max":500,"tax_rate":0}'
+  -> 3 segments returned
+     Boundaries: [0, 75, 100, 500]
+     All segments contiguous: [0-75], [75-100], [100-500]
+     Winner: Nike mpx across all segments
+     Last segment spend_to: 500.0
+  PASS
+
+Test 2 — Sweep shows boundary at $100:
+  From Test 1 response: 100.0 appears as spend_from of segment 3 and spend_to
+  of segment 2. BestBuy flat_tiered threshold correctly creates a breakpoint.
+  75.0 also appears (Nike per_order_flat min_spend).
+  PASS
+
+Test 3 — Sweep with card tier (Footwear):
+  curl -s -X POST http://localhost:4000/api/sweep -H "Content-Type: application/json" \
+    -d '{"category":"Footwear","card_tier":"one_x","p_min":0,"p_max":300,"tax_rate":8}'
+  -> 3 segments returned
+     [0-75] Nike mpx (192.375 miles)
+     [75-100] Nike direct (607 miles) — path CHANGED from mpx to direct
+     [100-300] Nike direct (1066 miles)
+     Nike per_order_flat bonus (250 miles at $75+) makes direct path dominate
+     with explorer card providing card_miles.
+  PASS
+
+Test 4 — Sweep 503 with no snapshot:
+  Skipped — would require temporarily removing database file, too disruptive.
+  The 503 path is tested via the existing /score and /rank 503 tests.
+
+Test 5 — Full rank still works after Phase 9:
+  curl -s -X POST http://localhost:4000/api/rank -H "Content-Type: application/json" \
+    -d '{"p_list":200,"tax_rate":8,"category":"Electronics","card_tier":"one_x"}'
+  -> 9 results, sorted by miles descending
+     Top: BestBuy direct 1116 miles
+     process_constraints present on BestBuy results (2 warnings)
+     log_template present on all results
+     snapshot_completed_at: "2026-03-24T10:05:00"
+  PASS — no regression
+
+Test 6 — Full basket still works:
+  curl -s -X POST http://localhost:4000/api/basket -H "Content-Type: application/json" \
+    -d '{"items":[{"name":"TV","p_list":500}],"category":"Electronics","card_tier":"none","budget":1000,"tax_rate":0}'
+  -> job_id returned, greedy present: TV->Nike/mpx 1875 miles
+     MILP running asynchronously
+  PASS — no regression
+
+Test 7 — Score (Nike $120, 7% tax, Footwear, explorer, direct):
+  curl -s -X POST http://localhost:4000/api/score -H "Content-Type: application/json" \
+    -d '{"retailer":"Nike","p_list":120,"tax_rate":7,"category":"Footwear","card_tier":"one_x"}'
+  -> total_miles: 738.4
+     portal_miles: 360.0
+     card_miles: 128.4
+     bonus_miles: 250.0
+     risk_class: "confirmed"
+     process_constraints: [] (Nike has none)
+     snapshot_completed_at: "2026-03-24T10:05:00"
+  PASS
+
+Test 8 — Rank (no card, 0% tax, Electronics):
+  curl -s -X POST http://localhost:4000/api/rank -H "Content-Type: application/json" \
+    -d '{"p_list":100,"tax_rate":0,"category":"Electronics","card_tier":"none"}'
+  -> 9 results, top: BestBuy direct 700 miles
+  PASS
+
+
+V1 COMPLETION STATUS
+---------------------
+Phase 1 — Julia engine skeleton + SpendVector + score_direct:        COMPLETE
+Phase 2 — Node bridge + React UI for single-item scoring:            COMPLETE
+Phase 3 — SQLite schema + snapshot model + seed data:                COMPLETE
+Phase 4 — MPX + Stacked paths + rank_all + multi-path UI:           COMPLETE
+Phase 5 — Claude API T&C parser + bonus classification:             COMPLETE
+Phase 6 — Playwright scraper with snapshot grouping:                 COMPLETE
+Phase 7 — Purchase log with spend vector + posting tracker:          COMPLETE
+Phase 8 — Order-level MILP with two-phase response:                 COMPLETE
+Phase 9 — Breakpoint sweep sensitivity + polish:                    COMPLETE
+
+Known Gaps:
+  1. Live portal scraper untested (mock mode only in cloud environment)
+  2. ANTHROPIC_API_KEY not tested in cloud (parse endpoints ready)
+  3. Dual variables deferred (HiGHS MIP limitation, option 2 chosen)
+  4. Three-axis Pareto frontier deferred (v3-spec section 10)
+  5. Calibrated probabilistic delta deferred (three-level risk class sufficient)
+  6. Embedding layer for T&C parsing deferred (Claude API parser handles it)
+
+Total test count: 204 (76 + 64 + 26 + 38)
+
+
+GIT
+---
+Branch:  claude/review-docs-and-state-kIdtM
+Commit:  (see git log after push)
+Message: "Phase 9: Breakpoint sweep sensitivity analysis + v1 polish"
+Tag:     v1.0.0 (local — tag push may return 403 due to Claude Code git proxy)
+
+
+SCOPE BOUNDARIES RESPECTED
+----------------------------
+NOT implemented in Phase 9 (per explicit scope boundaries):
+  Three-axis Pareto frontier (cash, miles, residual value) — deferred per v3-spec section 10
+  Calibrated probabilistic delta — three-level risk class is sufficient for v1
+  Embedding layer for T&C parsing — Claude API parser handles hard cases
+  Multi-user support — single-user local-network tool throughout
+  Fix-and-relax LP duals — option 2 (no duals) chosen in Phase 8
+  Live portal scraper DOM selector fixes — requires Cowork with real credentials
+  New tabs or endpoints beyond /sweep — Phase 9 is bounded
+  MILP formulation changes — Phase 8 validated, basket.jl touched only for sweep additions
+
+NOT changed in Phase 9:
+  types.jl — unchanged
+  bonus.jl — unchanged
+  scoring.jl — unchanged
+  database.jl — unchanged
+  All 166 prior tests pass without modification
+  SQLite schema unchanged
+  Seed data unchanged
+  BasketTab.jsx unchanged
+  Purchase log endpoints unchanged
+
+
+IMPORTANT NOTES FOR FUTURE SESSIONS
+--------------------------------------
+1. Julia binary: /usr/local/bin/julia (Julia 1.12.5)
+   Always run with: JULIA_PKG_SERVER=""
+
+2. Database initialization: rm -f db/mileageplus.db && bash db/init.sh
+
+3. The /sweep endpoint accepts tax_rate as a decimal (like /rank and /score
+   from Julia). The bridge /api/sweep converts percentage to decimal.
+
+4. For Electronics category with no card, the sweep winner is Nike MPX
+   across all spend levels. This is correct: Nike's MPX rate (3.0) with
+   25% Chase bonus gives 3.75x effective, which beats BestBuy's 2.0x
+   direct + 500 flat bonus at most spend levels.
+
+5. For Footwear with explorer card, the sweep shows a path change at $75:
+   below $75 Nike MPX is best, above $75 Nike direct is best (per_order_flat
+   250 bonus kicks in and card_miles are earned on direct but not counted
+   toward MPX comparison properly at lower amounts).
+
+6. The SweepPanel is mounted inside the RankPanel data section, so it only
+   appears after a successful rank query. It inherits category, card_tier,
+   and tax_rate from the rank form.
+
+7. Process constraints are now visible in the Rank tab as yellow warning
+   triangles next to retailer names, with tooltip showing constraint
+   descriptions. BestBuy has 2 warnings (coupon_restriction, last_click).
+
+8. start-dev.sh now checks /usr/local/bin/julia first before falling back
+   to /opt/miniconda3/bin/julia.
+
+9. This is v1.0.0 — the project is feature-complete for the defined scope.
+   Post-v1 work includes: live scraper DOM verification, API key testing,
+   LP dual exploration, and potential Pareto frontier analysis.

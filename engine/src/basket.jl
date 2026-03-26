@@ -504,3 +504,104 @@ function milp_basket(
         return nothing
     end
 end
+
+# ---------------------------------------------------------------------------
+# Breakpoint sweep — Phase 9: piecewise-optimal sensitivity analysis
+# Per v3-spec.md §7.4: as spend varies, at what breakpoints does the
+# optimal earning path change?
+# ---------------------------------------------------------------------------
+
+struct SweepSegment
+    spend_from::Float64
+    spend_to::Float64
+    retailer_name::String
+    path::String
+    miles_at_midpoint::Float64
+    risk_class::String
+end
+
+"""
+    breakpoint_sweep(retailers, category, card_tier; p_min=0.0, p_max=1000.0, tax_rate=0.0)
+
+Sweep spend from p_min to p_max, identifying breakpoints where the optimal
+retailer/path changes. The breakpoints come from bonus thresholds (flat_tiered
+tier thresholds, per_order_flat min_spend values) and the boundary values p_min/p_max.
+
+Within each interval between consecutive breakpoints, all scoring functions are
+linear in spend (no thresholds are crossed mid-interval). We evaluate rank_all
+at the midpoint of each interval and record the best result.
+
+Returns a Vector{SweepSegment} of contiguous, non-overlapping segments covering
+[p_min, p_max].
+"""
+function breakpoint_sweep(
+    retailers::Vector,
+    category::String,
+    card_tier::CardTier;
+    p_min::Float64 = 0.0,
+    p_max::Float64 = 1000.0,
+    tax_rate::Float64 = 0.0
+)::Vector{SweepSegment}
+    # Edge case: single point
+    if p_min >= p_max
+        spend = SpendVector(p_min; tax_rate=tax_rate)
+        results = rank_all(retailers, category, spend, card_tier)
+        if isempty(results)
+            return [SweepSegment(p_min, p_min, "", "", 0.0, "uncertain")]
+        end
+        top = results[1]
+        return [SweepSegment(p_min, p_min, top.retailer_name, string(top.path),
+                             top.total_miles, string(top.risk_class))]
+    end
+
+    # Step 1: Collect breakpoints from all retailers' bonuses
+    breakpoints = Set{Float64}()
+    push!(breakpoints, p_min)
+    push!(breakpoints, p_max)
+
+    for r in retailers
+        for b in r.bonuses
+            if isa(b, FlatTieredBonus)
+                for (threshold, _) in b.thresholds
+                    push!(breakpoints, threshold)
+                end
+            elseif isa(b, PerOrderFlatBonus)
+                push!(breakpoints, b.min_spend)
+            elseif isa(b, RateMultiplierBonus)
+                # Rate multipliers don't have spend thresholds that create breakpoints
+                # (they apply uniformly), but if there were a min_order_value it would
+                # be modeled as a PerOrderFlatBonus or FlatTieredBonus instead.
+            end
+        end
+    end
+
+    # Step 2: Filter to [p_min, p_max], deduplicate, sort
+    bp_sorted = sort!(collect(filter(b -> b >= p_min && b <= p_max, breakpoints)))
+
+    # Ensure at least 2 breakpoints
+    if length(bp_sorted) < 2
+        bp_sorted = [p_min, p_max]
+    end
+
+    # Step 3: Evaluate each interval at its midpoint
+    segments = SweepSegment[]
+    for k in 1:(length(bp_sorted) - 1)
+        b_start = bp_sorted[k]
+        b_end = bp_sorted[k + 1]
+        midpoint = (b_start + b_end) / 2.0
+
+        spend = SpendVector(midpoint; tax_rate=tax_rate)
+        results = rank_all(retailers, category, spend, card_tier)
+
+        if isempty(results)
+            push!(segments, SweepSegment(b_start, b_end, "", "", 0.0, "uncertain"))
+        else
+            top = results[1]
+            push!(segments, SweepSegment(b_start, b_end, top.retailer_name,
+                                         string(top.path), top.total_miles,
+                                         string(top.risk_class)))
+        end
+    end
+
+    return segments
+end

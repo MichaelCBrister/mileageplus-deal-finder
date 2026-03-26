@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import BasketTab from './BasketTab';
+import SweepPanel from './SweepPanel';
 
 const CARD_TIERS = [
   { value: 'none', label: 'No Chase United card' },
@@ -564,7 +565,13 @@ function RankPanel() {
               <tbody>
                 {data.results.map((r, i) => (
                   <tr key={i} style={{ backgroundColor: loggedRows[i] ? '#e8f5e9' : (i % 2 === 0 ? 'transparent' : '#fafafa'), transition: 'background-color 0.5s' }}>
-                    <td style={styles.tdLabel}>{r.retailer_name}</td>
+                    <td style={styles.tdLabel}>
+                      {r.retailer_name}
+                      {r.process_constraints && r.process_constraints.length > 0 && (
+                        <span title={r.process_constraints.map(c => c.description).join('; ')}
+                          style={{ marginLeft: 4, cursor: 'help', color: '#f57f17', fontSize: 14 }}>&#9888;</span>
+                      )}
+                    </td>
                     <td style={styles.tdLabel}>{r.path}</td>
                     <td style={styles.tdValue}>{r.total_miles.toLocaleString()}</td>
                     <td style={styles.tdValue}>{r.portal_miles.toLocaleString()}</td>
@@ -609,6 +616,12 @@ function RankPanel() {
               </tbody>
             </table>
           </div>
+
+          <SweepPanel
+            category={form.category}
+            card_tier={form.card_tier}
+            tax_rate={form.tax_rate}
+          />
         </div>
       )}
     </div>

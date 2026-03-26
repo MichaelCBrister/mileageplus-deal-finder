@@ -14,4 +14,5 @@ include(joinpath(@__DIR__, "..", "src", "basket.jl"))
     include("test_scoring.jl")
     include("test_phase4.jl")
     include("test_phase8.jl")
+    include("test_phase9.jl")
 end
