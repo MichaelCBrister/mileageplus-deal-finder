@@ -619,7 +619,7 @@ end
 # ---------------------------------------------------------------------------
 
 function main()
-    port = 5000
+    port = parse(Int, get(ENV, "JULIA_ENGINE_PORT", "5001"))
 
     # Open database
     db_path = get_db_path()

@@ -10,6 +10,13 @@ mkdir -p "$LOGS"
 
 echo "Starting MileagePlus Deal Finder dev environment..."
 
+# Kill any stale processes from prior sessions before starting fresh
+pkill -f "src/server.jl" 2>/dev/null || true
+pkill -f "$ROOT/bridge/server.js" 2>/dev/null || true
+# Also kill any bridge holding port 4000 that may have started from a different path
+lsof -ti :4000 | xargs kill -9 2>/dev/null || true
+sleep 1
+
 # 0. Ensure npm dependencies are installed
 for dir in bridge scraper; do
   if [ ! -d "$ROOT/$dir/node_modules" ]; then
@@ -18,28 +25,37 @@ for dir in bridge scraper; do
   fi
 done
 
-# 1. Julia engine (port 5000)
-echo "Starting Julia engine..."
+# 1. Julia engine (port 5001 — port 5000 is reserved by macOS AirPlay Receiver)
+JULIA_ENGINE_PORT="${JULIA_ENGINE_PORT:-5001}"
+echo "Starting Julia engine on port $JULIA_ENGINE_PORT..."
 cd "$ROOT/engine"
-# Use /usr/local/bin/julia if available, fall back to conda
-JULIA_BIN="/usr/local/bin/julia"
-if [ ! -f "$JULIA_BIN" ]; then
-  JULIA_BIN="/opt/miniconda3/bin/julia"
+# Resolve Julia binary: prefer juliaup (~/.juliaup/bin/julia), then PATH, then legacy paths
+if [ -f "$HOME/.juliaup/bin/julia" ]; then
+  JULIA_BIN="$HOME/.juliaup/bin/julia"
+elif command -v julia >/dev/null 2>&1; then
+  JULIA_BIN="$(command -v julia)"
+elif [ -f /usr/local/bin/julia ]; then
+  JULIA_BIN="/usr/local/bin/julia"
+else
+  echo "ERROR: julia not found. Install via https://julialang.org/downloads/" >&2
+  exit 1
 fi
-JULIA_PKG_SERVER="" "$JULIA_BIN" --project=. src/server.jl > "$LOGS/julia.log" 2>&1 &
+echo "  Using Julia: $JULIA_BIN"
+JULIA_ENGINE_PORT="$JULIA_ENGINE_PORT" JULIA_PKG_SERVER="" "$JULIA_BIN" --project=. src/server.jl > "$LOGS/julia.log" 2>&1 &
 JULIA_PID=$!
 echo "  Julia PID: $JULIA_PID"
 
 # Wait for Julia to be ready
-sleep 3
-echo "  Waiting for Julia health check..."
-for i in 1 2 3 4 5; do
-    if curl -s http://localhost:5000/health > /dev/null 2>&1; then
+sleep 5
+echo "  Waiting for Julia health check (Julia JIT startup takes ~15s)..."
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$JULIA_ENGINE_PORT/health" 2>/dev/null || echo "000")
+    if [ "$STATUS" = "200" ]; then
         echo "  Julia engine is healthy."
         break
     fi
-    if [ "$i" -eq 5 ]; then
-        echo "  WARNING: Julia engine did not respond to health check after 8s."
+    if [ "$i" -eq 15 ]; then
+        echo "  WARNING: Julia engine did not respond to health check after 20s."
         echo "  Check $LOGS/julia.log for errors."
     fi
     sleep 1
@@ -48,7 +64,7 @@ done
 # 2. Node bridge (port 4000)
 echo "Starting Node bridge..."
 cd "$ROOT/bridge"
-node server.js > "$LOGS/bridge.log" 2>&1 &
+JULIA_ENGINE_URL="http://localhost:$JULIA_ENGINE_PORT" node server.js > "$LOGS/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 echo "  Bridge PID: $BRIDGE_PID"
 sleep 1
@@ -68,7 +84,7 @@ echo "$FRONTEND_PID" >> "$LOGS/pids.txt"
 echo ""
 echo "=============================================="
 echo "  Dev stack running."
-echo "  Julia:    http://localhost:5000"
+echo "  Julia:    http://localhost:$JULIA_ENGINE_PORT"
 echo "  Bridge:   http://localhost:4000"
 echo "  Frontend: http://localhost:3000"
 echo ""
