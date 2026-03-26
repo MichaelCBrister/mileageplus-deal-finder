@@ -1150,7 +1150,24 @@ app.get('/api/search/status/:search_id', (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Production static file serving (Phase 15)
+// In production, the bridge serves the built React app from frontend/dist/.
+// API routes above are registered first, so /api/* never reaches this middleware.
+// A catch-all returns index.html for client-side routing (React Router / history API).
+// ---------------------------------------------------------------------------
+if (process.env.NODE_ENV === 'production') {
+  const DIST_PATH = path.join(__dirname, '..', 'frontend', 'dist');
+  app.use(express.static(DIST_PATH));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(DIST_PATH, 'index.html'));
+  });
+}
+
 app.listen(BRIDGE_PORT, () => {
   console.log(`Bridge server listening on port ${BRIDGE_PORT}`);
   console.log(`Julia engine URL: ${JULIA_ENGINE_URL}`);
+  if (process.env.NODE_ENV === 'production') {
+    console.log(`Serving frontend from ${path.join(__dirname, '..', 'frontend', 'dist')}`);
+  }
 });
