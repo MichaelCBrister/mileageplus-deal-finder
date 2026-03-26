@@ -698,6 +698,153 @@ app.get('/api/basket/status/:job_id', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Progressive loading search state (Phase 13)
+// ---------------------------------------------------------------------------
+
+// In-memory search state: Map<searchId, StateObject>
+// Each entry expires after SEARCH_STATE_TTL_MS (5 minutes).
+const searchStateMap = new Map();
+const SEARCH_STATE_TTL_MS = 5 * 60 * 1000;
+
+// Sweep expired entries every minute. .unref() prevents this from keeping the
+// Node process alive if everything else has finished.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, state] of searchStateMap.entries()) {
+    if (now - state.created_at > SEARCH_STATE_TTL_MS) {
+      searchStateMap.delete(id);
+    }
+  }
+}, 60 * 1000).unref();
+
+/**
+ * Background task: for each stale retailer, attempt scrape then re-rank via Julia,
+ * and update the searchStateMap entry. Called via setImmediate after /api/search responds.
+ * Per v3-spec §2.4: randomized 2–10 s delay between retailers; fail-closed on scrape error.
+ */
+async function processStaleRetailersBackground(searchId) {
+  const state = searchStateMap.get(searchId);
+  if (!state) return;
+
+  const scrapeOne = getScrapeOne();
+  const retailersToProcess = [...state.stale_retailers]; // snapshot at call time
+
+  for (let i = 0; i < retailersToProcess.length; i++) {
+    const retailerName = retailersToProcess[i];
+    if (!searchStateMap.has(searchId)) break; // cleaned up by TTL
+
+    // 1. Attempt scrape — skip on failure, continue to next retailer.
+    if (scrapeOne) {
+      try {
+        const r = await scrapeOne(retailerName);
+        if (!r.success) {
+          console.warn(`[bg ${searchId}] scrape failed for ${retailerName}: ${r.error}`);
+        }
+      } catch (err) {
+        console.error(`[bg ${searchId}] scrapeOne threw for ${retailerName}:`, err.message);
+      }
+    }
+
+    // 2. Re-score via Julia /rank with the original search parameters.
+    const st = searchStateMap.get(searchId);
+    if (!st) break;
+
+    try {
+      const sp = st.search_params;
+      const ctl = new AbortController();
+      const tid = setTimeout(() => ctl.abort(), 5000);
+
+      const rankResp = await fetch(`${JULIA_ENGINE_URL}/rank`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          p_list: sp.p_list,
+          category: sp.category,
+          card_tier: sp.card_tier,
+          tax_rate: sp.tax_rate,
+        }),
+        signal: ctl.signal,
+      });
+      clearTimeout(tid);
+
+      if (rankResp.ok) {
+        const rankData = await rankResp.json();
+        const hit = (rankData.results || []).find(
+          (r) => normalizeForMatch(r.retailer_name) === normalizeForMatch(retailerName)
+        );
+
+        if (hit) {
+          // Re-query portal_url from DB — scrapeOne may have updated it.
+          let portalUrl = st.retailer_meta[retailerName]?.portal_url || null;
+          try {
+            const db = new Database(DB_PATH);
+            const row = db.prepare(
+              `SELECT portal_url FROM retailers
+               WHERE LOWER(REPLACE(name, ' ', '')) = LOWER(REPLACE(?, ' ', ''))`
+            ).get(retailerName);
+            db.close();
+            if (row?.portal_url) portalUrl = row.portal_url;
+          } catch { /* keep cached value */ }
+
+          const enriched = {
+            retailer: hit.retailer_name,
+            path: hit.path,
+            path_label: PATH_LABELS[hit.path] || hit.path,
+            total_miles: Math.round(hit.total_miles),
+            breakdown: {
+              portal: Math.round(hit.portal_miles || 0),
+              card: Math.round(hit.card_miles || 0),
+              bonus: Math.round(hit.bonus_miles || 0),
+              mpx: Math.round(hit.mpx_miles || 0),
+            },
+            risk_class: hit.risk_class,
+            portal_url: portalUrl,
+            data_age_hours: 0,
+            stale: false,
+          };
+
+          // Merge: remove any prior entry for this retailer, insert fresh one, re-sort.
+          const live = searchStateMap.get(searchId);
+          if (live) {
+            const others = live.results.filter(
+              (r) => normalizeForMatch(r.retailer) !== normalizeForMatch(retailerName)
+            );
+            others.push(enriched);
+            others.sort((a, b) => b.total_miles - a.total_miles);
+            others.forEach((r, idx) => {
+              if (idx === 0) r.top_pick = true;
+              else delete r.top_pick;
+            });
+            live.results = others;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[bg ${searchId}] re-rank failed for ${retailerName}:`, err.message);
+    }
+
+    // 3. Remove this retailer from the pending stale list.
+    const live = searchStateMap.get(searchId);
+    if (live) {
+      live.stale_retailers = live.stale_retailers.filter((r) => r !== retailerName);
+      if (live.stale_retailers.length === 0) live.refreshing = false;
+    }
+
+    // 4. Randomized inter-retailer delay (2–10 s, per v3-spec §2.4).
+    if (i < retailersToProcess.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2000 + Math.random() * 8000));
+    }
+  }
+
+  // Final guard: ensure refreshing=false even if loop exited early.
+  const live = searchStateMap.get(searchId);
+  if (live) {
+    live.refreshing = false;
+    live.stale_retailers = [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/config — Basic configuration status for the settings page (Phase 12)
 // ---------------------------------------------------------------------------
 
@@ -858,44 +1005,51 @@ app.post('/api/search', async (req, res) => {
       : []
   );
 
-  // Step 7: Assemble results — enrich Julia results with portal_url and freshness
+  // Step 7: Separate fresh vs stale retailers.
+  // The initial response returns only fresh results; stale retailers are delivered
+  // progressively via GET /api/search/status/:search_id polling (Phase 13).
   const now = Date.now();
   const staleRetailerSet = new Set();
+  const freshResults = [];
 
-  let results = juliaResults
-    .filter(r => !excludeSet.has(normalizeForMatch(r.retailer_name)))
-    .map(r => {
-      const meta = retailerMeta[r.retailer_name] || {};
+  for (const r of juliaResults) {
+    if (excludeSet.has(normalizeForMatch(r.retailer_name))) continue;
 
-      let dataAgeHours = null;
-      let stale = true; // no last_scraped → treat as stale
-      if (meta.last_scraped) {
-        const ageMs = now - new Date(meta.last_scraped).getTime();
-        dataAgeHours = Math.round((ageMs / (1000 * 3600)) * 10) / 10;
-        stale = dataAgeHours > FRESHNESS_HOURS;
-      }
+    const meta = retailerMeta[r.retailer_name] || {};
+    let dataAgeHours = null;
+    let stale = true; // no last_scraped → treat as stale
+    if (meta.last_scraped) {
+      const ageMs = now - new Date(meta.last_scraped).getTime();
+      dataAgeHours = Math.round((ageMs / (1000 * 3600)) * 10) / 10;
+      stale = dataAgeHours > FRESHNESS_HOURS;
+    }
 
-      if (stale) staleRetailerSet.add(r.retailer_name);
+    if (stale) {
+      staleRetailerSet.add(r.retailer_name);
+      continue; // will be added via progressive loading after background scrape
+    }
 
-      return {
-        retailer: r.retailer_name,
-        path: r.path,
-        path_label: PATH_LABELS[r.path] || r.path,
-        total_miles: Math.round(r.total_miles),
-        breakdown: {
-          portal: Math.round(r.portal_miles || 0),
-          card: Math.round(r.card_miles || 0),
-          bonus: Math.round(r.bonus_miles || 0),
-          mpx: Math.round(r.mpx_miles || 0),
-        },
-        risk_class: r.risk_class,
-        portal_url: meta.portal_url || null,
-        data_age_hours: dataAgeHours,
-        stale,
-      };
-    })
-    // Sort by total_miles descending (Julia sorts by MPD which can differ)
-    .sort((a, b) => b.total_miles - a.total_miles);
+    freshResults.push({
+      retailer: r.retailer_name,
+      path: r.path,
+      path_label: PATH_LABELS[r.path] || r.path,
+      total_miles: Math.round(r.total_miles),
+      breakdown: {
+        portal: Math.round(r.portal_miles || 0),
+        card: Math.round(r.card_miles || 0),
+        bonus: Math.round(r.bonus_miles || 0),
+        mpx: Math.round(r.mpx_miles || 0),
+      },
+      risk_class: r.risk_class,
+      portal_url: meta.portal_url || null,
+      data_age_hours: dataAgeHours,
+      stale: false,
+    });
+  }
+
+  // Sort by total_miles descending (Julia sorts by MPD which can differ)
+  freshResults.sort((a, b) => b.total_miles - a.total_miles);
+  let results = freshResults;
 
   // Step 8: Mark top pick
   let topPickIndex = null;
@@ -932,7 +1086,25 @@ app.post('/api/search', async (req, res) => {
     console.error('search: could not write to search_log:', err.message);
   }
 
-  // Step 10: Return response
+  // Step 10: Store search state and kick off background scraping for stale retailers.
+  if (staleRetailers.length > 0) {
+    searchStateMap.set(searchId, {
+      results: results.map((r) => ({ ...r })), // shallow copy so mutations don't alias
+      stale_retailers: [...staleRetailers],
+      refreshing: true,
+      search_params: {
+        p_list: price,
+        category: interpreted.interpreted_category,
+        card_tier: mappedCardTier,
+        tax_rate: 0.08,
+      },
+      retailer_meta: retailerMeta,
+      created_at: Date.now(),
+    });
+    setImmediate(() => processStaleRetailersBackground(searchId));
+  }
+
+  // Step 11: Return response
   res.json({
     search_id: searchId,
     query: query.trim(),
@@ -949,6 +1121,32 @@ app.post('/api/search', async (req, res) => {
     top_pick_index: topPickIndex,
     snapshot_id: snapshotId,
     snapshot_completed_at: snapshotCompletedAt,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/search/status/:search_id — Progressive loading poll (Phase 13)
+// ---------------------------------------------------------------------------
+
+app.get('/api/search/status/:search_id', (req, res) => {
+  const state = searchStateMap.get(req.params.search_id);
+  if (!state) {
+    return res.status(404).json({
+      error: 'not_found',
+      message: 'Search state not found or expired (5-minute TTL)',
+    });
+  }
+
+  // Return a snapshot of the current accumulated results.
+  // results array is sorted and top_pick is already marked by processStaleRetailersBackground.
+  const results = state.results;
+  res.json({
+    search_id: req.params.search_id,
+    results,
+    stale_retailers: state.stale_retailers,
+    refreshing: state.refreshing,
+    result_count: results.length,
+    top_pick_index: results.length > 0 ? 0 : null,
   });
 });
 

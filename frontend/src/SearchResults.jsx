@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 
 const CARD_TIERS = [
   { value: 'none', label: 'No Chase United card' },
@@ -34,9 +34,15 @@ export default function SearchResults({ query: initialQuery, onNavigate }) {
   const [error, setError] = useState(null);
   const [searchData, setSearchData] = useState(null);
   const [loggedKeys, setLoggedKeys] = useState({});
+  const pollIntervalRef = useRef(null);
 
   const runSearch = useCallback(async (q, tier, excludes, priceOvr) => {
     if (!q || !q.trim()) return;
+    // Stop polling for any previous search before starting a new one.
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -72,6 +78,50 @@ export default function SearchResults({ query: initialQuery, onNavigate }) {
       runSearch(initialQuery, getInitialCardTier(), [], '');
     }
   }, []);
+
+  // Progressive loading: poll /api/search/status while refreshing is active (Phase 13).
+  // Effect re-runs when search_id or refreshing changes; cleanup stops the interval.
+  useEffect(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (!searchData?.refreshing || !searchData?.search_id) return;
+
+    const searchId = searchData.search_id;
+
+    const poll = async () => {
+      try {
+        const resp = await fetch(`/api/search/status/${searchId}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        setSearchData((prev) => {
+          // Guard: only apply if this is still the same search.
+          if (!prev || prev.search_id !== searchId) return prev;
+          return {
+            ...prev,
+            results: data.results,
+            stale_retailers: data.stale_retailers,
+            refreshing: data.refreshing,
+            result_count: data.result_count,
+            top_pick_index: data.top_pick_index,
+          };
+        });
+      } catch {
+        // Ignore network errors during polling; retry on next tick.
+      }
+    };
+
+    pollIntervalRef.current = setInterval(poll, 3000);
+
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchData?.refreshing, searchData?.search_id]);
 
   const handleSearchSubmit = (e) => {
     e.preventDefault();
@@ -243,12 +293,12 @@ export default function SearchResults({ query: initialQuery, onNavigate }) {
         </div>
       )}
 
-      {/* Status: refreshing stale retailers */}
+      {/* Status: refreshing stale retailers (Phase 13 progressive loading) */}
       {searchData?.refreshing && (
         <div className="refreshing-indicator">
           <span className="refreshing-spinner" aria-hidden="true" />
-          Refreshing {searchData.stale_retailers.length} store
-          {searchData.stale_retailers.length !== 1 ? 's' : ''}…
+          Refreshing {searchData.stale_retailers?.length ?? 0} store
+          {(searchData.stale_retailers?.length ?? 0) !== 1 ? 's' : ''}…
         </div>
       )}
 
