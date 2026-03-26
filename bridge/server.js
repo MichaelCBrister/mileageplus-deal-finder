@@ -1,5 +1,6 @@
 // server.js — Express bridge between React frontend and Julia engine (port 4000)
 // Phase 2: forwards /api/score to Julia engine on port 5000
+// Phase 10: adds freshness middleware — auto-scrapes stale retailers before scoring
 
 const express = require('express');
 const path = require('path');
@@ -9,6 +10,102 @@ const { insertPurchase, listPurchases, markPosted, deletePurchase } = require('.
 
 const JULIA_ENGINE_URL = process.env.JULIA_ENGINE_URL || 'http://localhost:5000';
 const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '4000', 10);
+
+// Freshness threshold in hours — retailers scraped within this window are considered fresh.
+// Configurable via FRESHNESS_HOURS env var (default 24).
+const FRESHNESS_HOURS = parseFloat(process.env.FRESHNESS_HOURS || '24');
+
+// ---------------------------------------------------------------------------
+// Freshness middleware helpers (Phase 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Check whether a retailer's data is stale.
+ * Returns { stale: boolean, last_scraped: string|null, age_hours: number|null }
+ */
+function checkFreshness(retailerName) {
+  try {
+    const db = new Database(DB_PATH);
+    const row = db.prepare(
+      `SELECT last_scraped FROM retailers
+       WHERE LOWER(REPLACE(name, ' ', '')) = LOWER(REPLACE(?, ' ', ''))`
+    ).get(retailerName);
+    db.close();
+
+    if (!row || !row.last_scraped) {
+      return { stale: true, last_scraped: null, age_hours: null };
+    }
+
+    const ageMs = Date.now() - new Date(row.last_scraped).getTime();
+    const ageHours = ageMs / (1000 * 3600);
+    return {
+      stale: ageHours > FRESHNESS_HOURS,
+      last_scraped: row.last_scraped,
+      age_hours: Math.round(ageHours * 10) / 10,
+    };
+  } catch (err) {
+    // DB error — treat as fresh to avoid blocking scoring
+    console.error('checkFreshness DB error:', err.message);
+    return { stale: false, last_scraped: null, age_hours: null };
+  }
+}
+
+/**
+ * Lazy-load scrapeOne from the scraper module.
+ * Returns null if the scraper module can't be loaded (e.g. missing deps).
+ */
+function getScrapeOne() {
+  try {
+    const { scrapeOne } = require(path.resolve(__dirname, '..', 'scraper', 'src', 'scrape-one.js'));
+    return scrapeOne;
+  } catch (err) {
+    console.warn('freshness: scrapeOne not available:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Refresh a single retailer if its data is stale.
+ * Returns true if a scrape was triggered, false if skipped.
+ */
+async function refreshIfStale(retailerName) {
+  const freshness = checkFreshness(retailerName);
+  if (!freshness.stale) return false;
+
+  const scrapeOne = getScrapeOne();
+  if (!scrapeOne) return false;
+
+  console.log(`freshness: ${retailerName} is stale (age: ${freshness.age_hours}h) — scraping...`);
+  const result = await scrapeOne(retailerName);
+  if (!result.success) {
+    console.warn(`freshness: scrapeOne failed for ${retailerName}: ${result.error}`);
+  } else {
+    console.log(`freshness: ${retailerName} refreshed (snapshot ${result.snapshot_id})`);
+  }
+  return true;
+}
+
+/**
+ * Refresh all stale retailers found in the database.
+ * Scrapes them sequentially (no parallelism per CLAUDE.md §2.4).
+ */
+async function refreshAllStale() {
+  let db;
+  let retailerNames = [];
+  try {
+    db = new Database(DB_PATH);
+    const rows = db.prepare(`SELECT name FROM retailers`).all();
+    db.close();
+    retailerNames = rows.map((r) => r.name);
+  } catch (err) {
+    console.error('refreshAllStale: could not list retailers:', err.message);
+    return;
+  }
+
+  for (const name of retailerNames) {
+    await refreshIfStale(name);
+  }
+}
 const DB_PATH = path.resolve(__dirname, '..', 'db', 'mileageplus.db');
 
 const app = express();
@@ -43,7 +140,13 @@ app.get('/health', async (_req, res) => {
 });
 
 // POST /api/score — forward to Julia engine with 2s timeout
+// Phase 10: checks freshness of requested retailer and scrapes if stale.
 app.post('/api/score', async (req, res) => {
+  // Freshness check — refresh before scoring if data is stale
+  if (req.body.retailer) {
+    await refreshIfStale(req.body.retailer);
+  }
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2000);
@@ -99,7 +202,11 @@ app.post('/api/score', async (req, res) => {
 });
 
 // POST /api/rank — forward to Julia engine with 5s timeout (Phase 4)
+// Phase 10: checks freshness of all retailers and scrapes any that are stale.
 app.post('/api/rank', async (req, res) => {
+  // Refresh all stale retailers before ranking (transparent to caller)
+  await refreshAllStale();
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);

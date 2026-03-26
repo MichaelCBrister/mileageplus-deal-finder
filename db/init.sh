@@ -14,6 +14,15 @@ echo "Initializing database at ${DB_PATH}"
 sqlite3 "${DB_PATH}" < "${SCRIPT_DIR}/schema.sql"
 echo "Schema applied."
 
+# Apply migrations (each migration is idempotent via shell error suppression)
+# 001: Add last_scraped column to retailers — ALTER TABLE ADD COLUMN fails silently
+#      if the column already exists (we suppress the error, not the exit code for other errors)
+if sqlite3 "${DB_PATH}" < "${SCRIPT_DIR}/migrations/001-add-last-scraped.sql" 2>/dev/null; then
+  echo "Migration 001 applied (last_scraped column added)."
+else
+  echo "Migration 001 already applied (last_scraped column exists)."
+fi
+
 # Apply seed data (INSERT OR IGNORE / INSERT OR REPLACE makes this idempotent)
 sqlite3 "${DB_PATH}" < "${SCRIPT_DIR}/seed.sql"
 echo "Seed data applied."
