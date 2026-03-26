@@ -264,6 +264,67 @@ sqlite3 db/mileageplus.db < db/seeds/fixture_rates.sql
 
 If the spec is ambiguous on a point, choose the conservative option and document the decision in a code comment with `# DECISION: [rationale]`. Prefer correctness over performance. Prefer explicit over clever. Ask the user if genuinely uncertain rather than guessing.
 
+## V1 COMPLETE — PHASE 9 NOTES
+
+### Current File Structure
+
+**Engine (Julia):**
+- `engine/src/types.jl` — SpendVector, Retailer, CardTier, BonusOffer hierarchy, ScoreResult
+- `engine/src/bonus.jl` — compute_bonus dispatch for all bonus types
+- `engine/src/scoring.jl` — score_direct, score_mpx, score_stacked, rank_all, classify_category_from_tc
+- `engine/src/database.jl` — SQLite read functions, RetailerData, SnapshotInfo, ProcessConstraint
+- `engine/src/basket.jl` — greedy_basket, milp_basket, breakpoint_sweep, SweepSegment
+- `engine/src/server.jl` — HTTP.jl endpoints: /health, /score, /rank, /sweep, /basket, /basket/status
+- `engine/src/MileagePlusDealFinder.jl` — module definition and exports
+
+**Bridge (Node.js):**
+- `bridge/server.js` — Express proxy with /api/score, /api/rank, /api/sweep, /api/basket, /api/purchases, /api/scraper, /api/parse-tc, /api/parse-bonus
+- `bridge/tc-parser.js` — Claude API T&C and bonus parser
+- `bridge/purchase-log.js` — Purchase log database operations
+
+**Frontend (React):**
+- `frontend/src/App.jsx` — Main app with Score, Rank, Purchases, Scraper tabs (~1110 lines)
+- `frontend/src/BasketTab.jsx` — Basket optimizer tab (~250 lines)
+- `frontend/src/SweepPanel.jsx` — Spend sensitivity slider panel (~230 lines)
+
+**Scraper:**
+- `scraper/src/scraper.js` — Playwright scraper with mock fallback
+- `scraper/src/snapshot.js` — Snapshot lifecycle management
+- `scraper/src/portal-mock.js` — Mock portal data for testing
+- `scraper/src/request-log.js` — Audit log writer
+
+**Database:**
+- `db/schema.sql` — Full DDL
+- `db/seed.sql` — Seed data (3 retailers, bonuses, T&C rules)
+- `db/init.sh` — Database initialization script
+
+### Test Count
+
+204 total tests across all phases:
+- Phase 1-3 (test_bonus.jl, test_scoring.jl): 76
+- Phase 4 (test_phase4.jl): 64
+- Phase 8 (test_phase8.jl): 26
+- Phase 9 (test_phase9.jl): 38
+
+### Known Gaps
+
+1. **Live portal scraper untested** — DOM selectors are best-effort. Requires Cowork with real portal credentials on desktop. Mock mode works for pipeline testing.
+2. **ANTHROPIC_API_KEY not tested in cloud** — Parse endpoints return 400 api_key_missing without it. Functional and ready for use with key.
+3. **Dual variables deferred** — HiGHS cannot compute duals for MIPs. Option 2 (no duals) chosen in Phase 8. Fix-and-relax LP duals (option 1) are post-v1.
+4. **Three-axis Pareto frontier deferred** — v3-spec section 10 explicitly deferred.
+5. **Calibrated probabilistic delta deferred** — Three-level risk class sufficient for v1.
+6. **Embedding layer for T&C deferred** — Claude API parser handles hard cases.
+
+### Instructions for Phase 10+ Sessions
+
+1. Read CLAUDE.md and docs/v3-spec.md
+1.5. Read docs/v2-spec.md (the v2 product specification)
+2. Read all phase session summaries (docs/phase1-session-summary.txt through phase9-session-summary.txt)
+3. Initialize database: `rm -f db/mileageplus.db && bash db/init.sh`
+4. Run test suite: `cd engine && JULIA_PKG_SERVER="" julia --project test/runtests.jl` (expect 204 passes)
+5. Start dev stack: `bash scripts/start-dev.sh`
+6. Julia binary: `/usr/local/bin/julia` (Julia 1.12.5). Always use `JULIA_PKG_SERVER=""`
+
 ## v2 Build Phases
 
 See docs/v2-spec.md for the complete v2 product specification.
