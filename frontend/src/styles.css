@@ -57,6 +57,13 @@ body {
   color: #222;
 }
 
+.nav-icon-btn.active {
+  color: #1565c0;
+  background: #e3f2fd;
+  border-bottom: 2px solid #1565c0;
+  cursor: default;
+}
+
 .nav-logo-btn {
   background: none;
   border: none;
@@ -629,6 +636,13 @@ body {
   font-weight: 700;
   margin: 0;
   color: #111;
+  flex: 1;
+}
+
+.page-header-nav {
+  display: flex;
+  gap: 0;
+  margin-left: 4px;
 }
 
 .page-content {
@@ -874,3 +888,56 @@ body {
 .text-success { color: #2e7d32; }
 .text-error { color: #c62828; }
 .text-muted { font-size: 13px; color: #888; }
+
+/* ── Phase 14 mobile polish ──────────────────────────────────────────── */
+
+/* On narrow screens, shop button and log button go full-width */
+@media (max-width: 479px) {
+  .card-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .card-actions {
+    margin-left: 0;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .shop-btn {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .log-btn {
+    text-align: center;
+  }
+}
+
+/* Settings inputs: uncap width on narrow screens */
+@media (max-width: 479px) {
+  .settings-input,
+  .settings-select {
+    max-width: 100%;
+    width: 100%;
+  }
+}
+
+/* Log form fields: full-width on narrow screens */
+@media (max-width: 479px) {
+  .form-row {
+    flex-direction: column;
+  }
+
+  .form-field {
+    min-width: unset;
+    width: 100%;
+  }
+
+  .form-input,
+  .form-select {
+    width: 100% !important;
+  }
+}

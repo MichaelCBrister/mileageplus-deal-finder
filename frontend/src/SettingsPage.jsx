@@ -56,6 +56,25 @@ export default function SettingsPage({ onNavigate }) {
           &#8592;
         </button>
         <h1 className="page-title">Settings</h1>
+        <div className="page-header-nav">
+          <button
+            className="nav-icon-btn"
+            onClick={() => onNavigate('/purchases')}
+            title="Purchases"
+            aria-label="Purchases"
+          >
+            &#9776;
+          </button>
+          <button
+            className="nav-icon-btn active"
+            aria-label="Settings"
+            aria-current="page"
+            title="Settings"
+            disabled
+          >
+            &#9881;
+          </button>
+        </div>
       </header>
 
       <div className="page-content">

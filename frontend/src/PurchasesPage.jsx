@@ -133,6 +133,25 @@ export default function PurchasesPage({ onNavigate }) {
           &#8592;
         </button>
         <h1 className="page-title">Purchases</h1>
+        <div className="page-header-nav">
+          <button
+            className="nav-icon-btn active"
+            aria-label="Purchases"
+            aria-current="page"
+            title="Purchases"
+            disabled
+          >
+            &#9776;
+          </button>
+          <button
+            className="nav-icon-btn"
+            onClick={() => onNavigate('/settings')}
+            title="Settings"
+            aria-label="Settings"
+          >
+            &#9881;
+          </button>
+        </div>
       </header>
 
       <div className="page-content">
