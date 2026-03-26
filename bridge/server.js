@@ -4,9 +4,11 @@
 
 const express = require('express');
 const path = require('path');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const { parseTAndC, parseBonus } = require('./tc-parser');
 const { insertPurchase, listPurchases, markPosted, deletePurchase } = require('./purchase-log');
+const { interpretQuery, normalizeForMatch } = require('./search-interpreter');
 
 const JULIA_ENGINE_URL = process.env.JULIA_ENGINE_URL || 'http://localhost:5000';
 const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '4000', 10);
@@ -693,6 +695,250 @@ app.get('/api/basket/status/:job_id', async (req, res) => {
       : `Julia engine unreachable: ${err.message}`;
     res.status(503).json({ error: 'engine_unavailable', message });
   }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/search — Query interpretation + scoring + results (Phase 11)
+// ---------------------------------------------------------------------------
+
+// Human-readable labels for each earning path.
+const PATH_LABELS = {
+  direct: 'Shop directly',
+  mpx: 'Buy gift card first',
+  stacked: 'Gift card + portal',
+};
+
+/**
+ * Fuzzy-match Claude-returned retailer names against actual DB retailer names.
+ *
+ * Pass 1 (primary): normalize both sides by lowercasing and stripping all
+ * non-alphanumeric characters — "Best Buy" = "BestBuy" = "bestbuy".
+ *
+ * Pass 2 (fallback): SQL LIKE with spaces-only removal, per v2-spec §4.
+ * Run as a single query for efficiency.
+ *
+ * Returns an array of DB-canonical retailer names, one per input name (or the
+ * original name if no DB match could be found).
+ */
+function matchLikelyRetailers(likelyNames, db) {
+  if (!likelyNames || likelyNames.length === 0) return [];
+
+  // Build a map of normalized-name → canonical DB name for fast pass-1 lookup.
+  let allRetailers = [];
+  try {
+    allRetailers = db.prepare('SELECT name FROM retailers').all().map(r => r.name);
+  } catch {
+    return likelyNames;
+  }
+  const normalizedDb = allRetailers.map(name => ({ name, norm: normalizeForMatch(name) }));
+
+  const matched = [];
+  for (const likely of likelyNames) {
+    const norm = normalizeForMatch(likely);
+
+    // Pass 1: exact normalized match
+    const pass1 = normalizedDb.find(d => d.norm === norm);
+    if (pass1) {
+      matched.push(pass1.name);
+      continue;
+    }
+
+    // Pass 2: SQL LIKE with spaces-only removal
+    try {
+      const row = db.prepare(
+        `SELECT name FROM retailers
+         WHERE LOWER(REPLACE(name, ' ', '')) LIKE LOWER(REPLACE(?, ' ', ''))`
+      ).get(likely);
+      matched.push(row ? row.name : likely);
+    } catch {
+      matched.push(likely);
+    }
+  }
+  return matched;
+}
+
+app.post('/api/search', async (req, res) => {
+  const {
+    query,
+    card_tier,
+    exclude_retailers,
+    price_override,
+  } = req.body;
+
+  if (!query || typeof query !== 'string' || query.trim() === '') {
+    return res.status(400).json({ error: 'missing_query', message: 'query is required' });
+  }
+
+  // Step 1: Interpret query via Claude API (falls back gracefully if key missing)
+  const interpreted = await interpretQuery(query.trim());
+
+  // Step 2: Resolve price — price_override takes precedence over AI estimate
+  const price = (price_override != null && typeof price_override === 'number')
+    ? price_override
+    : interpreted.estimated_price;
+
+  // Step 3: Map card_tier (same aliases as /api/score and /api/rank)
+  const mappedCardTier = mapCardTier(card_tier || 'none');
+
+  // Step 4: Forward to Julia /rank
+  let juliaResults = [];
+  let snapshotId = '';
+  let snapshotCompletedAt = '';
+
+  try {
+    const controller = new AbortController();
+    const rankTimeout = setTimeout(() => controller.abort(), 5000);
+
+    const rankResp = await fetch(`${JULIA_ENGINE_URL}/rank`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        p_list: price,
+        category: interpreted.interpreted_category,
+        card_tier: mappedCardTier,
+        tax_rate: 0.08, // default per v3-spec; Phase 14 will expose settings override
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(rankTimeout);
+
+    if (rankResp.ok) {
+      const rankData = await rankResp.json();
+      juliaResults = rankData.results || [];
+      snapshotId = rankData.snapshot_id || '';
+      snapshotCompletedAt = rankData.snapshot_completed_at || '';
+    } else {
+      const rankData = await rankResp.json().catch(() => ({}));
+      return res.status(rankResp.status).json({
+        error: rankData.error || 'rank_error',
+        message: rankData.message || 'Julia engine returned an error',
+      });
+    }
+  } catch (err) {
+    const message = err.name === 'AbortError'
+      ? 'Julia engine request timed out (5s)'
+      : `Julia engine unreachable: ${err.message}`;
+    return res.status(503).json({ error: 'engine_unavailable', message });
+  }
+
+  // Step 5: Load retailer metadata (portal_url, last_scraped) from DB
+  let retailerMeta = {};
+  let matchedLikelyRetailers = interpreted.likely_retailers;
+  try {
+    const db = new Database(DB_PATH);
+    const rows = db.prepare('SELECT name, portal_url, last_scraped FROM retailers').all();
+    for (const row of rows) {
+      retailerMeta[row.name] = {
+        portal_url: row.portal_url || null,
+        last_scraped: row.last_scraped || null,
+      };
+    }
+    // Fuzzy-match Claude's retailer names → canonical DB names
+    matchedLikelyRetailers = matchLikelyRetailers(interpreted.likely_retailers, db);
+    db.close();
+  } catch (err) {
+    console.error('search: could not load retailer metadata:', err.message);
+  }
+
+  // Step 6: Build normalized exclude set
+  const excludeSet = new Set(
+    Array.isArray(exclude_retailers)
+      ? exclude_retailers.map(normalizeForMatch)
+      : []
+  );
+
+  // Step 7: Assemble results — enrich Julia results with portal_url and freshness
+  const now = Date.now();
+  const staleRetailerSet = new Set();
+
+  let results = juliaResults
+    .filter(r => !excludeSet.has(normalizeForMatch(r.retailer_name)))
+    .map(r => {
+      const meta = retailerMeta[r.retailer_name] || {};
+
+      let dataAgeHours = null;
+      let stale = true; // no last_scraped → treat as stale
+      if (meta.last_scraped) {
+        const ageMs = now - new Date(meta.last_scraped).getTime();
+        dataAgeHours = Math.round((ageMs / (1000 * 3600)) * 10) / 10;
+        stale = dataAgeHours > FRESHNESS_HOURS;
+      }
+
+      if (stale) staleRetailerSet.add(r.retailer_name);
+
+      return {
+        retailer: r.retailer_name,
+        path: r.path,
+        path_label: PATH_LABELS[r.path] || r.path,
+        total_miles: Math.round(r.total_miles),
+        breakdown: {
+          portal: Math.round(r.portal_miles || 0),
+          card: Math.round(r.card_miles || 0),
+          bonus: Math.round(r.bonus_miles || 0),
+          mpx: Math.round(r.mpx_miles || 0),
+        },
+        risk_class: r.risk_class,
+        portal_url: meta.portal_url || null,
+        data_age_hours: dataAgeHours,
+        stale,
+      };
+    })
+    // Sort by total_miles descending (Julia sorts by MPD which can differ)
+    .sort((a, b) => b.total_miles - a.total_miles);
+
+  // Step 8: Mark top pick
+  let topPickIndex = null;
+  if (results.length > 0) {
+    topPickIndex = 0;
+    results[0] = { ...results[0], top_pick: true };
+  }
+
+  const staleRetailers = Array.from(staleRetailerSet);
+  const searchId = crypto.randomUUID();
+  const topResult = results[0] || null;
+
+  // Step 9: Log search to search_log table
+  try {
+    const db = new Database(DB_PATH);
+    db.prepare(
+      `INSERT INTO search_log
+         (search_id, query, interpreted_category, estimated_price, likely_retailers,
+          card_tier, result_count, top_retailer, top_miles, searched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+    ).run(
+      searchId,
+      query.trim(),
+      interpreted.interpreted_category,
+      interpreted.estimated_price,
+      JSON.stringify(interpreted.likely_retailers),
+      card_tier || 'none',
+      results.length,
+      topResult ? topResult.retailer : null,
+      topResult ? topResult.total_miles : null
+    );
+    db.close();
+  } catch (err) {
+    console.error('search: could not write to search_log:', err.message);
+  }
+
+  // Step 10: Return response
+  res.json({
+    search_id: searchId,
+    query: query.trim(),
+    interpreted: {
+      category: interpreted.interpreted_category,
+      estimated_price: interpreted.estimated_price,
+      likely_retailers: matchedLikelyRetailers,
+      query_type: interpreted.query_type,
+    },
+    results,
+    stale_retailers: staleRetailers,
+    refreshing: staleRetailers.length > 0,
+    result_count: results.length,
+    top_pick_index: topPickIndex,
+    snapshot_id: snapshotId,
+    snapshot_completed_at: snapshotCompletedAt,
+  });
 });
 
 app.listen(BRIDGE_PORT, () => {

@@ -23,6 +23,10 @@ else
   echo "Migration 001 already applied (last_scraped column exists)."
 fi
 
+# 002: Add search_log table — CREATE TABLE IF NOT EXISTS makes this idempotent
+sqlite3 "${DB_PATH}" < "${SCRIPT_DIR}/migrations/002-add-search-log.sql"
+echo "Migration 002 applied (search_log table ready)."
+
 # Apply seed data (INSERT OR IGNORE / INSERT OR REPLACE makes this idempotent)
 sqlite3 "${DB_PATH}" < "${SCRIPT_DIR}/seed.sql"
 echo "Seed data applied."
