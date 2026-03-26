@@ -6,11 +6,11 @@
 
 This is a personal tool that finds the best miles-per-dollar value when purchasing through the United MileagePlus Shopping portal. It treats retailer selection as a formal mathematical optimization problem.
 
-The user has one MileagePlus account, uses United Chase credit cards, and accesses the tool from both desktop and phone. This started as a single-user local-network developer tool (v1, Phases 0–9). It is being transformed into a search engine accessible by family via Cloudflare Tunnel (v2, Phases 10–15).
+The user has one MileagePlus account, uses United Chase credit cards, and accesses the tool from both desktop and phone over local WiFi. This is a single-user, local-network application — no auth, no multi-tenancy.
+
+This started as a single-user local-network developer tool (v1, Phases 0–9). It is being transformed into a search engine accessible by family via Cloudflare Tunnel (v2, Phases 10–15).
 
 ## Architecture
-
-### v1 Architecture (Phases 0–9, COMPLETE)
 
 Four layers: **Capture → Store → Compute → Display**
 
@@ -21,42 +21,24 @@ Four layers: **Capture → Store → Compute → Display**
 | Compute | Julia (HTTP.jl, JuMP, HiGHS)     | `/engine`             |
 | Display | Node.js/Express + React           | `/bridge` and `/frontend` |
 
-```
-Browser → React (:3000) → Express (:4000) → Julia HTTP.jl (:5001) → SQLite
-                                                                        ↑
-                                                    Playwright scraper ─┘
-```
-
-### v2 Architecture (Phases 10–15, IN PROGRESS)
-
-The Julia engine, SQLite schema, and Node bridge are unchanged. The frontend is replaced with a search-first UI. Scraping becomes on-demand (triggered by search, not manual). Claude API interprets search queries. Cloudflare Tunnel provides remote HTTPS access.
+The Julia engine runs as a persistent HTTP server. The Node bridge talks to it over localhost. The React frontend talks to the Node bridge. The Playwright scraper runs separately via Cowork on the desktop and writes to SQLite.
 
 ```
-Phone/Browser (miles.yourdomain.com)
-        |
-  Cloudflare Tunnel (free)
-        |
-  Express Bridge (:4000) — serves React static build + API
-        |--- POST /api/search → Claude API (query interpretation) → Julia /rank → results
-        |--- GET /api/search/status/:id → progressive loading poll
-        |--- Playwright scrapeOne() → on-demand per-retailer refresh
-        |--- /api/purchases (unchanged from v1)
-        |--- Julia Engine (:5001) — scoring, ranking (unchanged from v1)
-                 |--- SQLite — all persistent data
+Browser → React (localhost:3000) → Express (localhost:4000) → Julia HTTP.jl (localhost:5001) → SQLite
+                                                                                                  ↑
+                                                                          Playwright scraper (Cowork) ─┘
 ```
-
-In production mode, the Express bridge serves the React build (`frontend/dist/`) as static files and handles API routes — no separate Vite dev server needed.
 
 ## Critical Design Decisions — Do Not Deviate
 
 ### 1. Card miles are independent of portal eligibility
-Card miles (`p_card × c_r(k)`) are ALWAYS earned on the posted transaction amount. They are NEVER multiplied by the portal eligibility score δ. Portal tracking failures do not affect Chase credit card mile earning. This was the most important correction from v2 spec to v3 spec.
+Card miles (`p_card × c_r(k)`) are ALWAYS earned on the posted transaction amount. They are NEVER multiplied by the portal eligibility score δ. Portal tracking failures do not affect Chase credit card mile earning. This was the most important correction from v2 to v3.
 
 ```
-# WRONG — v2 spec bug
+# WRONG — v2 bug
 M = δ × p × (b_r + c_r)
 
-# CORRECT — v3 spec
+# CORRECT — v3
 portal_miles = δ × p_portal × b_r
 card_miles   = p_card × c_r(k)        # no δ
 M = portal_miles + card_miles + bonus_miles
@@ -94,132 +76,98 @@ The basket optimizer uses order-level decision variables. Items are assigned to 
 ### 8. Bonus semantics must be classified
 Rate multiplier bonuses have a `semantics` field: `:total`, `:incremental`, `:up_to`, or `:flat_bonus`. "Earn 5x" (total) is different from "Earn +2x bonus" (incremental). The Claude API parser must output this classification. The scoring function dispatches on it.
 
-### 9. v2: Search replaces tabs
-The entire v1 tab interface (Score, Rank, Basket, Scraper) is replaced by a single search bar. Users type what they want to buy, the app returns ranked results with portal links. All v1 engine code remains — the search endpoint calls `rank_all` internally.
-
-### 10. v2: On-demand scraping, not manual
-Scraping happens automatically when a user searches and retailer data is stale (older than FRESHNESS_HOURS, default 24). The `scrapeOne()` function refreshes one retailer at a time. The MileagePlus portal requires 2FA, so automated builds use MOCK DATA. Live scraping requires a manual one-time browser login to save session cookies.
-
-### 11. v2: Fuzzy retailer matching
-When the Claude API returns retailer names from query interpretation, match to database rows by normalizing: lowercase + strip all non-alphanumeric characters. "Best Buy", "BestBuy", "best buy" must all match.
-
 ## Technology Constraints
 
 ### Julia
-- Julia 1.10+ required (local Mac: 1.12.5 via Juliaup at `~/.juliaup/bin/julia`)
+- Julia 1.10+ required
 - Packages: HTTP.jl, JSON3.jl, SQLite.jl, JuMP.jl, HiGHS.jl
 - Use concrete types everywhere — avoid `Vector{BonusOffer}` with heterogeneous elements in hot loops. Use the abstract type for dispatch, concrete types for storage.
 - `Union{T, Nothing}` is fine for optional fields (Julia optimizes small unions), but prefer explicit sentinel values where they make the code clearer.
 - HiGHS cannot compute duals for MIPs. `dual_status(model)` returns `NO_SOLUTION`. Do not claim duals are available. If implementing duals later, use fix-and-relax and label as "LP relaxation estimate."
 - At ~400 retailers, prefer simple loops over matrix broadcasting. Profile before optimizing.
-- In cloud sessions: Julia may be at `/usr/local/bin/julia` or installed via conda. Always use `JULIA_PKG_SERVER=""`.
 
 ### Node.js / Express
 - Express bridge to Julia engine over localhost
-- Tiered timeouts: `/health` 1s, `/score` 2s, `/rank` 5s, `/basket` 30s (async), `/search` 10s (includes Claude API call)
+- Tiered timeouts: `/health` 1s, `/score` 2s, `/rank` 5s, `/basket` 30s (async)
 - The `/basket` endpoint returns a greedy solution in <200ms, then continues MILP solving. Poll `/basket/status/{job_id}` for the exact solution.
 - Sequential request queuing to Julia (one request at a time)
 - On Julia health check failure: log, attempt restart, serve cached results or error
 
 ### React
-- Accessible from phone and desktop
-- v2: Search bar home screen, result cards with portal links, hash-based routing
-- Show risk class as a visible badge on all recommendations
+- Accessible from phone and desktop over local WiFi
+- Show risk class as a visible column on all recommendations
 - Show "as of [date]" timestamps from snapshot IDs
-- Mobile-first: single-column cards at 375px, 44px minimum tap targets
-- Card tier stored in sessionStorage (resets on site close), default in localStorage
+- Show process constraint warnings per retailer
+- For MILP: show greedy solution immediately, upgrade to exact when ready
 
 ### SQLite
 - Schema is defined in `/db/schema.sql`
-- v2 additions: `search_log` table, `last_scraped` column on `retailers`
 - All scraped data rows carry `snapshot_id` foreign key
 - Append-only archive for raw T&C text (never delete/overwrite)
 - Purchase log stores full SpendVector and `snapshot_id` used at decision time
 
 ### Playwright Scraper
-- v1: batch scrape via Cowork (desktop only)
-- v2: on-demand `scrapeOne(retailerName)` called from the bridge during search
+- Runs via Cowork (desktop only), not from the web server
 - Randomized delays between requests (2–10 seconds)
-- Maximum one scrape per retailer per 24 hours
+- Maximum one full scrape per day
 - Fail closed: CAPTCHA, 429, or access-denied → abort and mark snapshot failed
 - Never scrape in parallel
 - Log all requests for audit
-- **2FA: automated builds use MOCK DATA. Live portal requires manual login to save browser cookies.**
 
 ## File Structure
 
 ```
 /engine/
   src/
-    MileagePlusDealFinder.jl — module definition and exports
-    types.jl          — SpendVector, Retailer, CardTier, BonusOffer hierarchy, ScoreResult
-    scoring.jl        — score_direct, score_mpx, score_stacked, classify_category_from_tc
+    types.jl          — SpendVector, Retailer, CardTier, BonusOffer hierarchy
+    scoring.jl        — score_direct, score_mpx, score_stacked
     ranking.jl        — rank_all
-    bonus.jl          — compute_bonus dispatch for all bonus types
+    bonus.jl          — compute_bonus dispatch for all types
     sensitivity.jl    — breakpoint sweep
-    basket.jl         — JuMP MILP, greedy_basket, milp_basket, breakpoint_sweep, SweepSegment
-    server.jl         — HTTP.jl endpoints: /health, /score, /rank, /sweep, /basket, /basket/status
-    database.jl       — SQLite read functions, RetailerData, SnapshotInfo, ProcessConstraint
-    db.jl             — (legacy, may be superseded by database.jl)
+    basket.jl         — JuMP MILP (Phase 8)
+    server.jl         — HTTP.jl endpoints
+    db.jl             — SQLite read functions
   test/
-    runtests.jl
-    test_bonus.jl, test_scoring.jl, test_ranking.jl — Phases 1-3
-    test_phase4.jl    — MPX, Stacked, rank_all
-    test_phase8.jl    — MILP basket
-    test_phase9.jl    — breakpoint sweep
+    test_scoring.jl
+    test_ranking.jl
+    test_bonus.jl
     test_basket.jl
   Project.toml
+  Manifest.toml
 
 /bridge/
-  server.js           — Express proxy: /api/score, /api/rank, /api/sweep, /api/basket, /api/purchases, /api/search (v2)
-  tc-parser.js        — Claude API T&C and bonus parser
-  purchase-log.js     — Purchase log database operations
-  search-interpreter.js — (v2 Phase 11) Claude API query interpretation
+  src/
+    index.js          — Express server
+    julia-bridge.js   — HTTP client to Julia with timeouts/retry
+    routes/
+      score.js
+      rank.js
+      basket.js
   package.json
 
 /frontend/
   src/
-    App.jsx           — v1: tabs; v2: hash router with SearchBar/SearchResults/Purchases/Settings
-    SearchBar.jsx     — (v2 Phase 12) search home screen
-    SearchResults.jsx — (v2 Phase 12) result cards with portal links
-    PurchasesPage.jsx — (v2 Phase 12) purchase history (moved from App.jsx)
-    SettingsPage.jsx  — (v2 Phase 12) settings page
-    BasketTab.jsx     — (v1, kept but not rendered in v2)
-    SweepPanel.jsx    — (v1, kept but not rendered in v2)
-    main.jsx
-  index.html
-  vite.config.js
+    App.jsx
+    components/
+    hooks/
   package.json
 
 /scraper/
   src/
-    scraper.js        — Playwright scraper (batch + scrapeOne for v2)
-    snapshot.js        — Snapshot lifecycle management
-    portal-mock.js    — Mock portal data for testing
-    request-log.js    — Audit log writer
+    scrape.js         — Playwright scraper entry point
+    parsers/          — Per-retailer or per-section parsers
+    snapshot.js       — Snapshot management
   package.json
 
 /db/
-  schema.sql          — Full DDL (includes v2 additions after Phase 10)
-  seed.sql            — Seed data (3 retailers, bonuses, T&C rules)
-  seeds/              — Alternate seed files
-  init.sh             — Database initialization script
-  migrations/         — (v2) incremental schema changes
+  schema.sql
+  seeds/
+    fixture_retailers.sql
+    fixture_rates.sql
 
 /docs/
-  v3-spec.md          — Source of truth: math, engine, scoring
-  v2-spec.md          — Source of truth: search UI, on-demand scraping, Phases 10-15
-  phase1-session-summary.txt through phase9-session-summary.txt
+  v3-spec.md          — Source of truth specification
   CHANGELOG.md
-
-/scripts/
-  start-dev.sh        — Start Julia + Bridge + Vite dev server
-  stop-dev.sh         — Kill dev processes
-  start-prod.sh       — (v2 Phase 15) production mode startup
-  stop-prod.sh        — (v2 Phase 15) production shutdown
-  install.sh          — (v2 Phase 15) full installation script
-  run-scraper.sh      — Manual batch scraper trigger
-  portal-login.sh     — (v2 Phase 10) placeholder for manual 2FA login
 
 /test/
   integration/        — End-to-end tests (Node → Julia → SQLite)
@@ -227,49 +175,35 @@ When the Claude API returns retailer names from query interpretation, match to d
 
 ## Build Phases
 
-### v1 Phases (ALL COMPLETE)
-
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 0 | Repo scaffolding | ✅ COMPLETE |
-| 1 | Julia engine skeleton + SpendVector + score_direct + HTTP server | ✅ COMPLETE |
-| 2 | Node bridge + React UI for single-item scoring | ✅ COMPLETE |
-| 3 | SQLite schema + snapshot model + seed data + Julia reads from DB | ✅ COMPLETE |
-| 4 | MPX + Stacked paths + rank_all + multi-path UI | ✅ COMPLETE |
-| 5 | Claude API T&C parser + risk class + bonus classification | ✅ COMPLETE |
-| 6 | Playwright scraper with snapshot grouping | ✅ COMPLETE |
-| 7 | Purchase log with spend vector + posting tracker | ✅ COMPLETE |
-| 8 | Order-level MILP with two-phase response | ✅ COMPLETE |
-| 9 | Breakpoint sweep sensitivity + polish | ✅ COMPLETE |
-
-### v2 Phases (IN PROGRESS)
+Work proceeds in numbered phases. Each phase has a clear deliverable and acceptance test. Do not skip phases or combine them unless explicitly told to.
 
 | Phase | Scope | Acceptance Test |
 |-------|-------|-----------------|
-| 10 | Single-retailer on-demand scraper + freshness middleware | Search for stale retailer auto-refreshes before scoring |
-| 11 | /api/search with Claude API query interpretation | POST /api/search with "AirPods" returns ranked results with category and price |
-| 12 | Frontend redesign: search bar home, result cards, filters, portal links | User can search, see results, tap to open portal page |
-| 13 | Progressive loading: instant fresh results + live updates for stale retailers | Stale retailers show spinner, results update as scrapes complete |
-| 14 | Purchases page + settings page + mobile polish | Purchases history works, card tier persists in session, mobile layout clean |
-| 15 | Cloudflare Tunnel + production build + startup scripts | App accessible at miles.yourdomain.com |
+| 1 | Julia engine skeleton + SpendVector + score_direct + HTTP server | `curl /score` returns correct miles for fixture retailer |
+| 2 | Node bridge + React UI for single-item scoring | Browser shows miles breakdown for typed query |
+| 3 | SQLite schema + snapshot model + seed data + Julia reads from DB | `/score` matches seed data; "as of" timestamp visible |
+| 4 | MPX + Stacked paths + rank_all + multi-path UI | Ranking shows 3 paths; stacked > direct when γ_r = 1 |
+| 5 | Claude API T&C parser + risk class + bonus classification | Parse 5 real T&C texts; verify against manual review |
+| 6 | Playwright scraper with snapshot grouping | Full scrape → complete snapshot; spot-check rates |
+| 7 | Purchase log with spend vector + posting tracker | Log purchase; verify pending status; manually mark posted |
+| 8 | Order-level MILP with two-phase response | 5-item basket: greedy in <200ms; MILP improves on it |
+| 9 | Breakpoint sweep sensitivity + polish | Spend slider shows piecewise-optimal retailer switches |
 
-Phase dependencies: 10 → 11 → 12 → 13 (critical path). 14 can run after 12. 15 runs after 12.
-
-**At the start of each phase:**
-1. Read this file, `/docs/v3-spec.md`, and `/docs/v2-spec.md`
+At the start of each phase:
+1. Read this file and `/docs/v3-spec.md`
 2. Review existing code from prior phases
 3. Confirm you understand the acceptance test before writing code
 4. Run existing tests to make sure nothing is broken
 
-**At the end of each phase:**
-1. All prior tests still pass (204 Julia tests minimum)
+At the end of each phase:
+1. All prior tests still pass
 2. New tests cover the phase deliverable
 3. Commit with message: `Phase N: [description]`
 4. Push to main
 
 ## Testing Expectations
 
-- **Julia:** Use `Test` stdlib. Every scoring function has unit tests with known inputs and expected outputs. **204 tests as of v1 completion.** All must pass at the start and end of every v2 phase.
+- **Julia:** Use `Test` stdlib. Every scoring function has unit tests with known inputs and expected outputs.
 - **Node:** Use Jest or Vitest. Test bridge timeout behavior, error handling, and route responses.
 - **Integration:** Test the full path from HTTP request to Julia to SQLite and back.
 - **Key test cases to always include:**
@@ -299,81 +233,115 @@ Phase dependencies: 10 → 11 → 12 → 13 (critical path). 14 can run after 12
 - PR into main when acceptance test passes
 - Commit messages: `Phase N: brief description`
 - Keep commits atomic — one logical change per commit
-- Tag releases: `v0.N.0` for v1 phases, `v2.0.0` after Phase 15
+- Tag releases: `v0.N.0` corresponding to phase completion
 
 ## Environment Setup
 
-### Local Mac (primary development environment)
+First-time setup for a new Claude Code session:
 
 ```bash
-# Julia
-~/.juliaup/bin/julia --version  # Julia 1.12.5
-
-# Clone and install
-gh repo clone MichaelCBrister/mileageplus-deal-finder
+# Clone repo
+gh repo clone [username]/mileageplus-deal-finder
 cd mileageplus-deal-finder
 
-# Julia packages
-cd engine && ~/.juliaup/bin/julia --project=. -e 'using Pkg; Pkg.instantiate()' && cd ..
+# Julia
+cd engine
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+cd ..
 
-# Node packages
+# Node
 cd bridge && npm install && cd ..
 cd frontend && npm install && cd ..
-cd scraper && npm install && cd ..
 
 # Database
-rm -f db/mileageplus.db && bash db/init.sh
-
-# Environment
-cp .env.example .env
-# Edit .env with your ANTHROPIC_API_KEY
-
-# Start dev stack
-bash scripts/start-dev.sh
+sqlite3 db/mileageplus.db < db/schema.sql
+# If seed data exists:
+sqlite3 db/mileageplus.db < db/seeds/fixture_retailers.sql
+sqlite3 db/mileageplus.db < db/seeds/fixture_rates.sql
 ```
 
-**Mac-specific notes:**
-- Julia engine runs on port **5001** (macOS AirPlay uses 5000)
-- Julia binary at `~/.juliaup/bin/julia` (via Juliaup, not system path)
-- Node 24, SQLite 3.51
+## Questions or Ambiguity
 
-### Cloud Claude Code sessions
+If the spec is ambiguous on a point, choose the conservative option and document the decision in a code comment with `# DECISION: [rationale]`. Prefer correctness over performance. Prefer explicit over clever. Ask the user if genuinely uncertain rather than guessing.
 
-```bash
-# Julia may need installation — let Claude Code handle it via conda
-# Always use JULIA_PKG_SERVER=""
-cd engine && JULIA_PKG_SERVER="" julia --project=. -e 'using Pkg; Pkg.instantiate()' && cd ..
+## V1 COMPLETE — PHASE 9 NOTES
 
-# If HTTP.jl fails with mbedtls error:
-conda install -c conda-forge "mbedtls=2.*"
-```
+### Current File Structure
 
-## v1 Completion Summary
+**Engine (Julia):**
+- `engine/src/types.jl` — SpendVector, Retailer, CardTier, BonusOffer hierarchy, ScoreResult
+- `engine/src/bonus.jl` — compute_bonus dispatch for all bonus types
+- `engine/src/scoring.jl` — score_direct, score_mpx, score_stacked, rank_all, classify_category_from_tc
+- `engine/src/database.jl` — SQLite read functions, RetailerData, SnapshotInfo, ProcessConstraint
+- `engine/src/basket.jl` — greedy_basket, milp_basket, breakpoint_sweep, SweepSegment
+- `engine/src/server.jl` — HTTP.jl endpoints: /health, /score, /rank, /sweep, /basket, /basket/status
+- `engine/src/MileagePlusDealFinder.jl` — module definition and exports
+
+**Bridge (Node.js):**
+- `bridge/server.js` — Express proxy with /api/score, /api/rank, /api/sweep, /api/basket, /api/purchases, /api/scraper, /api/parse-tc, /api/parse-bonus
+- `bridge/tc-parser.js` — Claude API T&C and bonus parser
+- `bridge/purchase-log.js` — Purchase log database operations
+
+**Frontend (React):**
+- `frontend/src/App.jsx` — Main app with Score, Rank, Purchases, Scraper tabs (~1110 lines)
+- `frontend/src/BasketTab.jsx` — Basket optimizer tab (~250 lines)
+- `frontend/src/SweepPanel.jsx` — Spend sensitivity slider panel (~230 lines)
+
+**Scraper:**
+- `scraper/src/scraper.js` — Playwright scraper with mock fallback
+- `scraper/src/snapshot.js` — Snapshot lifecycle management
+- `scraper/src/portal-mock.js` — Mock portal data for testing
+- `scraper/src/request-log.js` — Audit log writer
+
+**Database:**
+- `db/schema.sql` — Full DDL
+- `db/seed.sql` — Seed data (3 retailers, bonuses, T&C rules)
+- `db/init.sh` — Database initialization script
 
 ### Test Count
+
 204 total tests across all phases:
 - Phase 1-3 (test_bonus.jl, test_scoring.jl): 76
 - Phase 4 (test_phase4.jl): 64
 - Phase 8 (test_phase8.jl): 26
 - Phase 9 (test_phase9.jl): 38
 
-### Known Gaps (v1, carried forward)
-1. **Live portal scraper untested** — DOM selectors are best-effort. Requires manual login with real portal credentials. Mock mode works for pipeline testing.
+### Known Gaps
+
+1. **Live portal scraper untested** — DOM selectors are best-effort. Requires Cowork with real portal credentials on desktop. Mock mode works for pipeline testing.
 2. **ANTHROPIC_API_KEY not tested in cloud** — Parse endpoints return 400 api_key_missing without it. Functional and ready for use with key.
-3. **Dual variables deferred** — HiGHS cannot compute duals for MIPs. Fix-and-relax LP duals are post-v1.
-4. **Three-axis Pareto frontier deferred** — v3-spec section 10.
-5. **Calibrated probabilistic delta deferred** — Three-level risk class sufficient.
+3. **Dual variables deferred** — HiGHS cannot compute duals for MIPs. Option 2 (no duals) chosen in Phase 8. Fix-and-relax LP duals (option 1) are post-v1.
+4. **Three-axis Pareto frontier deferred** — v3-spec section 10 explicitly deferred.
+5. **Calibrated probabilistic delta deferred** — Three-level risk class sufficient for v1.
 6. **Embedding layer for T&C deferred** — Claude API parser handles hard cases.
 
-### v2 Additions to Track
-- `search_log` table (Phase 11)
-- `retailers.last_scraped` column (Phase 10)
-- `scrapeOne()` function (Phase 10)
-- `search-interpreter.js` (Phase 11)
-- Search-first frontend components (Phase 12)
-- Progressive loading (Phase 13)
-- Production build + Cloudflare Tunnel prep (Phase 15)
+### Instructions for Phase 10+ Sessions
 
-## Questions or Ambiguity
+1. Read CLAUDE.md and docs/v3-spec.md
+1.5. Read docs/v2-spec.md (the v2 product specification)
+2. Read all phase session summaries (docs/phase1-session-summary.txt through phase9-session-summary.txt)
+3. Initialize database: `rm -f db/mileageplus.db && bash db/init.sh`
+4. Run test suite: `cd engine && JULIA_PKG_SERVER="" julia --project test/runtests.jl` (expect 204 passes)
+5. Start dev stack: `bash scripts/start-dev.sh`
+6. Julia binary: `/usr/local/bin/julia` (Julia 1.12.5). Always use `JULIA_PKG_SERVER=""`
 
-If the spec is ambiguous on a point, **choose the conservative option** and document the decision in a code comment with `# DECISION: [rationale]`. Prefer correctness over performance. Prefer explicit over clever. Ask the user if genuinely uncertain rather than guessing.
+## v2 Build Phases
+
+See docs/v2-spec.md for the complete v2 product specification.
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 10 | Single-retailer on-demand scraper + freshness middleware | NOT STARTED |
+| 11 | /api/search with Claude API query interpretation | NOT STARTED |
+| 12 | Frontend redesign: search bar home, result cards, portal links | NOT STARTED |
+| 13 | Progressive loading for stale retailers | NOT STARTED |
+| 14 | Purchases page + settings page + mobile polish | NOT STARTED |
+| 15 | Production build + Cloudflare Tunnel prep | NOT STARTED |
+
+Phase dependencies: 10 → 11 → 12 → 13 (critical path). 14 can run after 12. 15 runs after 12.
+
+At the start of each v2 phase:
+1. Read CLAUDE.md, docs/v3-spec.md, and docs/v2-spec.md
+2. Run Julia tests: cd engine && JULIA_PKG_SERVER="" julia --project test/runtests.jl (expect 204 passes)
+3. All 204 Julia tests must pass at start AND end of every v2 phase
+4. Do not modify Julia engine source files unless a blocking bug is found
