@@ -1167,6 +1167,18 @@ if (process.env.NODE_ENV === 'production') {
 app.listen(BRIDGE_PORT, () => {
   console.log(`Bridge server listening on port ${BRIDGE_PORT}`);
   console.log(`Julia engine URL: ${JULIA_ENGINE_URL}`);
+
+  // Detect scraper mode: live (persistent browser session) or mock
+  const scraperAuthDir = path.join(__dirname, '..', 'scraper', 'auth', 'browser-context');
+  const fs = require('fs');
+  let scraperMode = 'mock';
+  try {
+    if (fs.existsSync(scraperAuthDir) && fs.readdirSync(scraperAuthDir).length > 0) {
+      scraperMode = 'live';
+    }
+  } catch {}
+  console.log(`Scraper mode: ${scraperMode}${scraperMode === 'mock' ? ' (run "cd scraper && npm run portal-login" for live scraping)' : ' (using saved browser session)'}`);
+
   if (process.env.NODE_ENV === 'production') {
     console.log(`Serving frontend from ${path.join(__dirname, '..', 'frontend', 'dist')}`);
   }

@@ -21,6 +21,9 @@ logs/
 *.db-wal
 *.db-shm
 
+# Scraper auth (session cookies — never commit)
+scraper/auth/
+
 # OS / Editor
 .DS_Store
 Thumbs.db

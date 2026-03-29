@@ -5,7 +5,9 @@
   "description": "Playwright-based scraper for MileagePlus Shopping portal",
   "scripts": {
     "setup": "npx playwright install chromium",
-    "scrape": "node src/scraper.js"
+    "scrape": "node src/scraper.js",
+    "portal-login": "node src/portal-login.js",
+    "test-scrape": "node src/test-scrape.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",
